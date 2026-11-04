@@ -1,0 +1,59 @@
+# 复制为 config.yaml 后设置环境变量；此文件不含密钥。
+# 默认仅本机访问。公网监听需要 allow_public_bind: true 和 bearer_key_env。
+listen: 127.0.0.1:8787
+allow_public_bind: false
+bearer_key_env: DECORA_BEARER_KEY
+allow_http_loopback: false  # 只供本机 mock 使用；不是允许任意 HTTP 上游
+max_body_bytes: 8388608
+max_response_bytes: 8388608
+max_images: 32
+max_in_flight: 64
+attempt_timeout_ms: 30000
+request_timeout_ms: 60000
+max_attempts: 3  # 整个请求的总调用次数（包括首次），不是每个候选各 3 次
+
+backends:
+  openai-primary:
+    kind: openai
+    model: gpt-6-luna
+    api_key_env: OPENAI_API_KEY
+    # endpoint: https://api.openai.com/v1/decisions  # 默认官方入口
+    priority: 0  # 越小越优先
+    weight: 1   # 同优先级按权重无放回排列
+    capabilities:
+      question_types: [predicate, choice, score]
+      messages: true
+      images: true
+      json_input: true
+      prompt_cache: true
+      safety_identifier: true
+      max_questions: 400
+
+# 公开模型 alias，客户端不能用 model 指定任意上游模型或 URL。
+models:
+  decora-luna: [openai-primary]
+
+# OpenRouter 和 TypeSafe/Jev 的官方 schema 已核实，但无法提供完整 OpenAI usage。
+# 当前严格接口下不可用，选中时提前返回 unsupported_usage，不发出付费请求。
+# 若要验证错误分支，可添加以下候选和公开 alias；启动也会要求该环境变量。
+# backends 中可添加
+#   jev-official:
+#     kind: typesafe
+#     model: jev-latest  # 账户可用名以 TypeSafe GET /v1/models 为准
+#     api_key_env: TYPESAFE_API_KEY
+#     priority: 10
+#     weight: 1
+#     capabilities:
+#       question_types: [predicate, choice, score]
+#       max_questions: 400
+#   router-jev:
+#     kind: openrouter
+#     model: typesafe/jev-1.13  # 文档示例，不保证当前账户可用
+#     api_key_env: OPENROUTER_API_KEY
+#     priority: 10
+#     weight: 1
+#     capabilities:
+#       question_types: [predicate, choice, score]
+#       max_questions: 400
+# models 中可添加
+#   jev-unavailable: [jev-official]
