@@ -96,14 +96,15 @@ TypeSafe openapi.json
 
 | 能力 | OpenAI 原生 | OpenRouter 原生 | TypeSafe/Jev 原生 |
 |---|---|---|---|
-| 默认 compatible 模式 HTTP 调用 | **支持** | **支持纯文本三题型** | **支持纯文本三题型** |
-| strict 模式 HTTP 调用 | 支持完整 OpenAI usage | 提前排除，unsupported_usage | 提前排除，unsupported_usage |
+| 默认模式 HTTP 调用 | **支持原生结构** | **支持文本/角色/JSON/typed choice 三题型转换** | 同左 |
+| usage_policy: strict | 支持完整 OpenAI usage | 提前排除，unsupported_usage | 提前排除，unsupported_usage |
 | 纯文本 predicate | 原样，probability | predicate→noul，noul→probability | 同左 |
 | 纯文本 choice，字符串值 | 原样，包括 descriptions | choices→criteria 对象；概率对象→数组 | 同左 |
-| choice 布尔值 | 支持，保留类型区别 | 明确 unsupported_boolean_choice | 同左 |
+| 布尔/字符串混合 choice | 支持原生类型区别 | 全组内部索引键，保留原值/描述，答案准确还原类型 | 同左 |
 | 纯文本 score | 原样，有序 labels/description | levels→criteria 数组；legend/概率索引→原标签 | 同左 |
 | 重复/省略 name | 支持 | 内部 q0/q1 键，还原原始名字和题序 | 同左 |
-| 角色消息 / JSON parts | 支持对应角色约束 | 网络调用前过滤，unsupported_native_mapping | 同左 |
+| 角色消息 / JSON parts | 原结构及原生角色约束 | 默认文本编码保留角色/顺序/JSON；input strict 可禁止降级 | 同左 |
+| 原生角色指令层级 | 由 OpenAI 执行 | 文本标签不提供原生层级保证 | 同左 |
 | input / question 图片 | 支持；共享总计数限制 | 提前过滤，可选择其他兼容候选 | 同左，不启用 danger-zone |
 | refusal | 支持，保留，绝不回退 | 官方答案 union 无 refusal；不虚构映射，未知类型报错且不回退 | 同左 |
 | 缓存与 safety 参数 | 支持，需候选能力声明 | 提前过滤，不静默丢弃 | 同左 |
@@ -146,7 +147,7 @@ TypeSafe 的兼容响应示例
 
 `adapter::native_body`、`native_answers`、`native_response` 实际用于网关 HTTP 请求/响应链路，不是只有纯函数样例。
 
-- 原生请求使用 `state` 与命名 `questions`，不是 OpenAI 的 `input/questions[]`，也不是 chat completions。只接受字符串 input 和字符串 instructions，避免角色/多模态语义降级。
+- 原生请求使用 `state` 与命名 `questions`，不是 OpenAI 的 `input/questions[]`，也不是 chat completions。字符串 input/instructions 原样使用；默认还支持经过显式文本编码的角色消息和 text/JSON 内容数组，详见下节。
 - score criteria 无说明时使用 label 字符串，有说明时使用官方允许的 `{label, description}` 结构化指导；返回 legend 必须精确对应该 criteria。
 - OpenRouter 把 choice/score 的 confidence、probabilities（score 还包括 legend）声明为可选，但完整核心答案需要这些信息。缺失时返回协议错误，不合成 confidence 或概率；本版也不猜测缺失 legend 的映射。
 - TypeSafe 图片依赖 assets 和 `TypeSafe-Danger-Zone-Images: true`；OpenRouter 图片存在 provider 和引用位置差异。本版不做这些跨协议多模态转换，提前过滤，不会在不支持的上游上付费试错。
@@ -154,7 +155,50 @@ TypeSafe 的兼容响应示例
 
 若依赖完整 OpenAI SDK 的固定 usage 明细，请选择 strict；可处理部分 usage 的客户端应使用默认 compatible，并读取 `usage.decora` 判断统计口径。
 
-## 4. 错误和路由的最小合同
+## 4. 角色、JSON 与 typed choice 的显式适配
+
+### 输入策略及能力
+
+`native_input_policy: textual` 为默认，只作用于 OpenRouter/TypeSafe；OpenAI 始终保留原始 input/questions 结构。
+
+- 消息数组按官方 OpenAI 已验证 schema 接收，角色仅为 system/developer/user/assistant，保留原顺序、标签、phase 及 content 的字符串/数组形态。不会添加自定义角色，也不擅加 Decisions 不支持的 name 等消息字段。
+- 字符串内容，包括空字符串，原样保留；内容数组中的 input_text/output_text/refusal 及 input_json.data 作为数据完整编码。允许空消息数组、空 content 数组、Unicode 与嵌套 JSON；仍受原请求的长度/JSON 深度等限制。
+- instructions 是字符串时原样使用；是 text/JSON 内容数组时编码到 native questions.qN.instructions。predicate/choice/score 共用此规则，题内 JSON 不丢失。
+- `capabilities.messages / json_input / typed_choices` 默认均为 true，可逐项设 false 禁止该候选承接对应请求。
+- `native_input_policy: strict` 在网络调用前禁止消息/内容数组的文本降级，返回 unsupported_textual_lowering 或选择其他兼容候选。它不禁止可逆 typed choice 映射。此开关与 usage_policy 完全独立。
+
+### 明确的编码与语义边界
+
+消息数组转换为以下 JSON 对象的**字符串序列化**，置于 native state；题目内容使用相同封装，kind 为 question_content，置于 native instructions。
+
+```json
+{
+  "decora_encoding": "openai_decisions_text_v1",
+  "kind": "messages",
+  "data": [{"role":"user","content":[{"type":"input_json","data":{"flag":false,"nested":[null,1,"中文"]}}]}]
+}
+```
+
+JSON 转义明确 data 边界，保留原数据的 JSON 类型和语义，而非拼接未经转义的分隔标签。对象键顺序不作为 JSON 语义承诺；不保留用户原始 JSON 的空白/字节格式。角色标签及顺序仍可被模型读取，但**上游没有原生执行 OpenAI 的角色指令层级**；只保留数据不等于同等指令约束。该编码也不是 prompt injection 安全隔离，模型仍可能遵从数据中的恶意指令。需要原生角色层级时应选择 OpenAI，或用 input strict 排除这种转换。
+
+真实 input_image 在编码前单独检查，即使管理员把 native 的 images 声明为 true，也不能绕过 adapter 的图片边界。共享输入和题目图片都提前排除，不把图片 URL 当已分析的视觉证据。input_json.data 中叫 role/type/image_url 的普通键保留为数据，不会触发图片处理或创建新角色。缓存断点和 safety 参数仍不做文本降级。
+
+### 布尔/字符串选项的可逆映射
+
+只要一组 choice 包含任意布尔值，该组所有选项统一使用 `decora_choice_0...N-1` 内部键，criteria 值为 `{value: 原始有类型JSON值, description?: 原始说明}`。示例：
+
+```json
+{
+  "decora_choice_0": {"value":true,"description":"布尔真"},
+  "decora_choice_1": {"value":"true","description":"字符串真"},
+  "decora_choice_2": {"value":false,"description":"布尔假"},
+  "decora_choice_3": {"value":"decora_choice_0","description":"与内部键同名的原始字符串"}
+}
+```
+
+所有值都走同一索引映射，因此 `true` 与 `"true"`、`false` 与 `"false"`、等于内部键的原始字符串及空字符串均不碰撞。false 是明确的 bool 值，不是 missing/default。response.choice 和 probabilities 的键必须对应内部选项，随后还原原始 value 类型与题序，再验证覆盖、概率和及最高概率选择；不接受未知键、缺项或原生响应中擅自返回的布尔 choice。纯字符串组保持已有字符串键映射以减少不必要变换。
+
+## 5. 错误和路由的最小合同
 
 - 入站 Bearer 缺失/无效：401，统一错误体和 `WWW-Authenticate: Bearer`。
 - 不存在的 alias：404；字段错误/能力 unsupported：400；body 超限：413；非 JSON：415。

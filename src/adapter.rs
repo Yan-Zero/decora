@@ -1,6 +1,6 @@
 //! 官方原生协议映射：默认保留真实可用 usage；严格模式拒绝口径或必需明细差异。
 use crate::{
-    config::{Backend, BackendKind, UsagePolicy},
+    config::{Backend, BackendKind, NativeInputPolicy, UsagePolicy},
     error::ApiError,
     protocol::{Answer, ChoiceValue, DecisionRequest, DecisionResponse, Question, Requirements},
 };
@@ -12,6 +12,7 @@ pub fn compatible(
     req: &DecisionRequest,
     need: &Requirements,
     usage_policy: UsagePolicy,
+    input_policy: NativeInputPolicy,
 ) -> Result<(), ApiError> {
     let c = &backend.capabilities;
     if req.questions.len() > c.max_questions
@@ -24,47 +25,122 @@ pub fn compatible(
         || (need.messages && !c.messages)
         || (need.cache && !c.prompt_cache)
         || (need.safety && !c.safety_identifier)
+        || (!c.typed_choices && has_boolean_choices(req))
     {
         return Err(ApiError::unsupported("unsupported_capability"));
     }
     if backend.kind != BackendKind::Openai {
-        validate_native_request(req)?;
+        validate_native_request(req, input_policy)?;
         if usage_policy == UsagePolicy::Strict {
             return Err(ApiError::unsupported("unsupported_usage"));
         }
     }
     Ok(())
 }
-fn validate_native_request(req: &DecisionRequest) -> Result<(), ApiError> {
-    if !req.input.is_string()
-        || req.questions.iter().any(|q| !q.instructions().is_string())
+fn has_boolean_choices(req: &DecisionRequest) -> bool {
+    req.questions.iter().any(|q| matches!(q, Question::Choice { choices, .. } if choices.iter().any(|c| matches!(c.value, ChoiceValue::Bool(_)))))
+}
+fn parts_have_images(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|parts| parts.iter().any(|p| p["type"] == "input_image"))
+}
+fn validate_native_request(
+    req: &DecisionRequest,
+    policy: NativeInputPolicy,
+) -> Result<(), ApiError> {
+    // 只检查真正的内容 part，不把 input_json.data 中同名字段当图片。
+    let images = req
+        .input
+        .as_array()
+        .is_some_and(|messages| messages.iter().any(|m| parts_have_images(&m["content"])))
+        || req
+            .questions
+            .iter()
+            .any(|q| parts_have_images(q.instructions()));
+    if images {
+        return Err(ApiError::unsupported("unsupported_native_images"));
+    }
+    let cache_markers = req.input.as_array().is_some_and(|messages| {
+        messages.iter().any(|m| {
+            m["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p.get("prompt_cache_breakpoint")
+                        .is_some_and(|b| !b.is_null())
+                })
+            })
+        })
+    });
+    if cache_markers
         || req.safety_identifier.is_some()
         || req.prompt_cache_key.is_some()
         || req.prompt_cache_options.is_some()
     {
         return Err(ApiError::unsupported("unsupported_native_mapping"));
     }
-    if req.questions.iter().any(|q| matches!(q, Question::Choice {choices,..} if choices.iter().any(|c| matches!(c.value, ChoiceValue::Bool(_))))) {
-        return Err(ApiError::unsupported("unsupported_boolean_choice"));
+    if policy == NativeInputPolicy::Strict
+        && (!req.input.is_string() || req.questions.iter().any(|q| !q.instructions().is_string()))
+    {
+        return Err(ApiError::unsupported("unsupported_textual_lowering"));
     }
     Ok(())
 }
-/// 将保守文本子集映射到 OpenRouter /api/alpha/decisions 或 TypeSafe /v1/systemone。
-/// 角色消息、多模态说明、布尔选项、缓存和安全标识无法保真时明确报错。
+fn choice_key(choices: &[crate::protocol::ChoiceOption], index: usize) -> String {
+    if choices
+        .iter()
+        .any(|c| matches!(c.value, ChoiceValue::Bool(_)))
+    {
+        // 全组选项统一重命名，原始字符串即使等于内部键也不会碰撞。
+        format!("decora_choice_{index}")
+    } else {
+        let ChoiceValue::String(s) = &choices[index].value else {
+            unreachable!("all strings")
+        };
+        s.clone()
+    }
+}
+fn textual(value: &Value, kind: &str) -> Value {
+    if value.is_string() {
+        return value.clone();
+    }
+    // JSON 转义明确 data 边界，但不声称能阻止模型层 prompt injection。
+    json!(
+        json!({"decora_encoding":"openai_decisions_text_v1","kind":kind,"data":value}).to_string()
+    )
+}
+/// 默认将角色/JSON 内容编码成结构化文本，保留数据而不冒充原生角色指令层级。
+/// 真实图片、缓存及 safety 参数仍须有独立协议支持，不能藏在文本中发送。
 pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError> {
-    validate_native_request(req)?;
+    native_body_with_policy(req, model, NativeInputPolicy::Textual)
+}
+/// 按配置策略生成官方 native 请求；strict 禁止结构化输入的文本降级。
+pub fn native_body_with_policy(
+    req: &DecisionRequest,
+    model: &str,
+    policy: NativeInputPolicy,
+) -> Result<Value, ApiError> {
+    validate_native_request(req, policy)?;
     let mut questions = Map::new();
     for (index, q) in req.questions.iter().enumerate() {
-        let mut question = json!({"type": q.kind(), "instructions": q.instructions()});
+        let mut question = json!({"type": q.kind(), "instructions": textual(q.instructions(), "question_content")});
         match q {
             Question::Predicate { .. } => question["type"] = json!("noul"),
             Question::Choice { choices, .. } => {
                 let mut criteria = Map::new();
-                for choice in choices {
-                    let ChoiceValue::String(value) = &choice.value else {
-                        return Err(ApiError::unsupported("unsupported_boolean_choice"));
+                let typed = choices
+                    .iter()
+                    .any(|c| matches!(c.value, ChoiceValue::Bool(_)));
+                for (i, choice) in choices.iter().enumerate() {
+                    let criterion = if typed {
+                        let mut criterion = json!({"value":choice.value});
+                        if let Some(description) = &choice.description {
+                            criterion["description"] = json!(description);
+                        }
+                        criterion
+                    } else {
+                        json!(choice.description)
                     };
-                    criteria.insert(value.clone(), json!(choice.description));
+                    criteria.insert(choice_key(choices, i), criterion);
                 }
                 question["criteria"] = Value::Object(criteria);
             }
@@ -83,7 +159,7 @@ pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError
         // 公开名称可重复、可省略；内部键稳定且无碰撞，原名称只在最终答案还原。
         questions.insert(format!("q{index}"), question);
     }
-    Ok(json!({"model": model, "state": req.input, "questions": questions}))
+    Ok(json!({"model": model, "state": textual(&req.input, "messages"), "questions": questions}))
 }
 /// 将 native 答案重排并转换为 OpenAI 题型形状；概率及 confidence 原样保留。
 /// 调用者仍须用 DecisionResponse::parse 校验概率和与期望。返回值没有 usage，不能独立用作 API 响应。
@@ -118,19 +194,16 @@ pub fn native_answers(value: &Value, req: &DecisionRequest) -> Result<Vec<Answer
                 if probs.len() != choices.len() {
                     return Err(ApiError::protocol());
                 }
-                answer["choice"] = a["choice"].clone();
+                let selected = a["choice"].as_str().ok_or_else(ApiError::protocol)?;
+                let selected_index = (0..choices.len())
+                    .find(|i| choice_key(choices, *i) == selected)
+                    .ok_or_else(ApiError::protocol)?;
+                answer["choice"] = json!(choices[selected_index].value);
                 answer["confidence"] = a["confidence"].clone();
-                answer["probabilities"] = json!(
-                    choices
-                        .iter()
-                        .map(|c| {
-                            let ChoiceValue::String(key) = &c.value else {
-                                unreachable!("native_body rejects booleans")
-                            };
-                            json!({"value": c.value, "probability": probs.get(key)})
-                        })
-                        .collect::<Vec<_>>()
-                );
+                answer["probabilities"] =
+                    json!(choices.iter().enumerate().map(|(i,c)| {
+                    json!({"value":c.value,"probability":probs.get(&choice_key(choices,i))})
+                }).collect::<Vec<_>>());
             }
             Question::Score { levels, .. } => {
                 if a["type"] != "score" {

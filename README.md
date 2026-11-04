@@ -2,7 +2,7 @@
 
 **Decora 是一个 Rust 实现的独立 Decisions 协议网关，已实现 OpenAI、OpenRouter 和 TypeSafe/Jev 三种原生 HTTP 链路。** 对外提供 `POST /v1/decisions`：接收 `model / input / questions`，保持 predicate、choice、score 的核心答案结构，透传 OpenAI 的逐题 refusal，并校验真实概率和 token 计数。它不调用聊天接口，不生成或伪造“校准概率”。
 
-**默认 `usage_policy: compatible`**：OpenRouter/Jev 的纯文本三题型可用，返回真实已知的 input/output、显式标记口径的合计及存在的明细；未知明细省略，绝不填 0。TypeSafe 的 billable input 通过 `usage.decora` 明确标记，不能当作 OpenAI 精确总输入。需要完整同构 usage 的调用者可设 `usage_policy: strict`，此时提前排除这两个上游。详见[协议与能力矩阵](docs/PROTOCOL.md)。
+**默认 `native_input_policy: textual`、`usage_policy: compatible`**：OpenRouter/Jev 支持文字、角色消息、JSON parts 和布尔/字符串混合 choice 的三题型转换；角色/JSON 以有边界的结构化文本传递，不冒充原生角色指令层级。返回真实已知的 input/output、显式标记口径的合计及存在的明细；未知明细省略，绝不填 0。TypeSafe 的 billable input 通过 `usage.decora` 明确标记，不能当作 OpenAI 精确总输入。需要完整同构 usage 的调用者可设 `usage_policy: strict`，此时提前排除这两个上游。详见[协议与能力矩阵](docs/PROTOCOL.md)。
 
 ## 快速开始
 
@@ -72,9 +72,28 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若上游提供 `cached_tokens`，则保留该明细而不补 `cache_write_tokens`。上游 cost 存在时保留为 `usage.decora.provider_cost`。依赖精确 OpenAI usage schema 的客户端请启用 strict，而不是将省略值解释为 0。
 
-### 多模态
+### 角色、JSON 与有类型选项
 
-OpenAI adapter 保留文字、图片和 JSON 的原始结构；不会把角色消息转换成普通文本。OpenRouter/Jev 本版仅接受字符串 input 和字符串 instructions，图片、角色消息、JSON parts、布尔 choice、缓存及 safety 参数在网络调用前被排除，可回退到支持这些能力的 OpenAI 候选。
+`native_input_policy` 独立于 usage 策略，**不改变 OpenAI adapter 的原始结构**。
+
+- `textual`（默认）：OpenRouter/Jev 收到字符串 input 时原样使用；消息数组被编码为 JSON 文本，放在官方允许的字符串 `state` 中。保留 system/developer/user/assistant 角色标签、顺序、phase、字符串或内容数组、空内容、Unicode，以及 `input_json.data` 的嵌套 JSON 语义。
+- 题目 instructions 为字符串时原样使用；为 text/JSON 内容数组时采用相同编码放入原生 instructions，不混入聊天 messages 协议。
+- `strict`：禁止上述结构化输入的文本降级，提前返回 `unsupported_textual_lowering` 或选择兼容 OpenAI 候选。它不禁止可逆的 typed choice 映射。
+- `capabilities.messages / json_input / typed_choices` 默认均为 true，可逐项设 false 让路由过滤该能力。
+
+消息编码结构如下；**整个对象序列化成一个字符串**作为 native state，`data` 的边界通过 JSON 转义保留。题目内容使用 `kind: question_content`。
+
+```json
+{"decora_encoding":"openai_decisions_text_v1","kind":"messages","data":[{"role":"system","content":"系统标签"},{"role":"user","content":[{"type":"input_json","data":{"ok":false,"nested":[1,"中文"]}}]}]}
+```
+
+这保留了角色标签和数据，**不等于上游原生执行 OpenAI 的角色指令优先级**。JSON 数据边界也不是 prompt injection 隔离：模型仍可能受内容中的恶意指令影响。需要原生层级语义时用 OpenAI 或启用 input strict。
+
+布尔 choice 与字符串可混用，包括 `true` / `"true"`、`false` / `"false"`。只要一组选项含布尔值，该组**所有选项**统一改用内部 `decora_choice_0...` 键，criteria 中保留原始 JSON 类型的 value 和 description。返回的 choice 与各概率 value 按映射还原；布尔 false 不作为缺省值。即使客户端字符串本身等于某个内部键，也不会碰撞；纯字符串组选项继续使用原字符串键。
+
+### 图片与其他多模态
+
+OpenAI adapter 保留原结构并支持图片。OpenRouter/Jev 本版仍对真实 `input_image` 独立筛选，**不会将图片 URL 编入文本后声称分析过图片**；可选择兼容 OpenAI 候选。JSON 数据中的同名 `image_url/type/role` 键只是普通数据。缓存/safety 参数仍不做 native 降级，不支持时提前过滤。
 
 ```bash
 curl http://127.0.0.1:8787/v1/decisions \
@@ -106,6 +125,7 @@ curl http://127.0.0.1:8787/v1/decisions \
 listen: 127.0.0.1:8787
 bearer_key_env: DECORA_BEARER_KEY
 usage_policy: compatible
+native_input_policy: textual  # strict 可禁止角色/JSON 内容的文本降级
 backends:
   jev-official:
     kind: typesafe
@@ -115,9 +135,29 @@ backends:
     weight: 1
     capabilities:
       question_types: [predicate, choice, score]
+      messages: true      # 默认 true；在此 adapter 中是文本编码而非原生角色层级
+      json_input: true    # 默认 true；保留嵌套 JSON 语义
+      typed_choices: true # 默认 true；混合布尔/字符串选项可逆映射
+      images: false
       max_questions: 400
 models:
   decora-jev: [jev-official]
+```
+
+例如向上述 TypeSafe 配置发送角色消息、题内 JSON 和混合 typed choice：
+
+```bash
+curl http://127.0.0.1:8787/v1/decisions \
+  -H "Authorization: Bearer $DECORA_BEARER_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"decora-jev",
+    "input":[{"role":"user","content":[{"type":"input_json","data":{"flag":false,"text":"true"}}]}],
+    "questions":[{"type":"choice","instructions":[
+      {"type":"input_text","text":"按 flag 的实际类型和值选择。"},
+      {"type":"input_json","data":{"field":"flag"}}
+    ],"choices":[{"value":true},{"value":"true"},{"value":false},{"value":"false"}]}]
+  }'
 ```
 
 OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID（官方示例为 `typesafe/jev-1.13`）和 `api_key_env: OPENROUTER_API_KEY`。默认入口分别为 `https://api.typesafe.ai/v1/systemone`、`https://openrouter.ai/api/alpha/decisions`；无需配置 endpoint。也可把多个后端 ID 放在同一 alias 中实现跨协议回退。
@@ -141,7 +181,7 @@ OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID�
 - 日志只记录固定消息、尝试次数和固定错误码；不记录输入、问题、响应正文、密钥、上游 URL、alias 或 YAML 内容。启动器固定启用 `decora=info`，不会接受 `RUST_LOG` 开启 HTTP 客户端的敏感 debug 日志。
 - 对外错误统一采用 `{"error":{"message":...,"type":...,"param":null,"code":...}}`，不回显上游错误正文。
 
-常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_boolean_choice`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
+常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_native_images`、`unsupported_textual_lowering`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
 
 ## 离线验证
 
@@ -152,9 +192,9 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-2026-11-04 实际结果：**26 项测试通过**（1 项单测 + 25 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
+2026-11-04 实际结果：**34 项测试通过**（1 项单测 + 33 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
 
-测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、三类上游的三题型 HTTP 往返、OpenRouter→TypeSafe 实际协议回退、默认 compatible 与 strict 策略、TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、角色与图片、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
+测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、三类上游的三题型 HTTP 往返、OpenRouter→TypeSafe 实际协议回退、默认 compatible 与 strict 策略、TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
 
 ## 上线前需要完成
 

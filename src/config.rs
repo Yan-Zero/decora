@@ -49,6 +49,20 @@ pub enum UsagePolicy {
     Strict,
 }
 
+/// 原生输入转换策略，独立于 usage_policy；不改变 OpenAI 原生传输。
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeInputPolicy {
+    /// 默认：将角色消息和内容数组编码为有边界的 JSON 文本；角色优先级不再原生执行。
+    #[default]
+    Textual,
+    /// 禁止结构化输入的文本降级，仅接受字符串 input/instructions。
+    Strict,
+}
+fn enabled() -> bool {
+    true
+}
+
 /// 上游原生协议；不包含聊天 completions 兼容模式。
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -75,10 +89,15 @@ pub struct Capabilities {
     pub question_types: Vec<String>,
     #[serde(default)]
     pub images: bool,
-    #[serde(default)]
+    /// 默认启用；native 上游通过显式文本编码支持，不代表原生 JSON part 协议。
+    #[serde(default = "enabled")]
     pub json_input: bool,
-    #[serde(default)]
+    /// 默认启用；native 上游保留角色标签与顺序，不执行 OpenAI 角色指令层级。
+    #[serde(default = "enabled")]
     pub messages: bool,
+    /// 默认启用；布尔和字符串选项保留准确类型，必要时使用内部键。
+    #[serde(default = "enabled")]
+    pub typed_choices: bool,
     #[serde(default)]
     pub prompt_cache: bool,
     #[serde(default)]
@@ -111,6 +130,8 @@ pub struct Config {
     pub bearer_key_env: Option<String>,
     #[serde(default)]
     pub usage_policy: UsagePolicy,
+    #[serde(default)]
+    pub native_input_policy: NativeInputPolicy,
     #[serde(default)]
     pub allow_http_loopback: bool,
     #[serde(default = "body")]
