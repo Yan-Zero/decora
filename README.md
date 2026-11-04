@@ -1,8 +1,8 @@
 # Decora
 
-**Decora 是一个 Rust 实现的独立 Decisions 协议网关，已实现 OpenAI、OpenRouter 和 TypeSafe/Jev 三种原生 HTTP 链路。** 对外提供 `POST /v1/decisions`：接收 `model / input / questions`，保持 predicate、choice、score 的核心答案结构，透传 OpenAI 的逐题 refusal，并校验真实概率和 token 计数。它不调用聊天接口，不生成或伪造“校准概率”。
+**Decora 是一个 Rust 实现的独立 Decisions 协议网关。所有公开 model alias 一律使用同一个 `POST /v1/decisions`：固定 OpenAI 形状的 `model / input / questions` 请求与 predicate、choice、score、refusal 核心答案。** 客户端不提交 Jev/OpenRouter 格式、不选择转换策略，也不使用上游的 state/criteria 参数。OpenAI、OpenRouter、TypeSafe/Jev 之间的格式转换由网关自动完成，不调用聊天接口，不伪造概率。
 
-**默认 `native_input_policy: textual`、`usage_policy: compatible`**：OpenRouter/Jev 支持文字、角色消息、JSON parts 和布尔/字符串混合 choice 的三题型转换；角色/JSON 以有边界的结构化文本传递，不冒充原生角色指令层级。返回真实已知的 input/output、显式标记口径的合计及存在的明细；未知明细省略，绝不填 0。TypeSafe 的 billable input 通过 `usage.decora` 明确标记，不能当作 OpenAI 精确总输入。需要完整同构 usage 的调用者可设 `usage_policy: strict`，此时提前排除这两个上游。详见[协议与能力矩阵](docs/PROTOCOL.md)。
+文字、角色消息、JSON parts 和布尔/字符串混合 choice 均自动适配；图片等真实能力仍先筛选。**尚存的合同例外是 usage**：默认服务端 `usage_policy: compatible` 保留真实已知统计、允许省略未知明细，并添加 `usage.decora` 标记，**并非严格完全符合 OpenAI usage schema**。TypeSafe billable input 不能冒充精确总输入，未知值也不填 0。管理员可在服务端选择 usage strict；该选项不属于客户端请求。详见[协议与能力矩阵](docs/PROTOCOL.md)。
 
 ## 快速开始
 
@@ -49,7 +49,9 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 评分以等级**位置 `0..N-1`**计分；不是根据 label 的数值计分。响应的 `confidence` 与最大类别概率是两个独立字段。概率是上游模型的估计，Decora 不额外证明其在业务数据上已经校准。
 
-### Usage 策略与透明扩展
+### Usage 管理选项与当前合同例外
+
+以下是**服务端 config.yaml 管理选项**，不是请求参数。本轮没有把兼容 usage 规范化为严格 OpenAI schema：省略必需明细和增加 `usage.decora` 都是已知差异，不能据此声称整个响应完全一致。
 
 - `compatible`（默认）：三类上游都可参与路由。原生 OpenAI 仍严格校验它本来就提供的完整 usage；OpenRouter/Jev 保留已知计数和存在的明细，未知字段省略。
 - `strict`：要求完整精确的 OpenAI usage，OpenRouter/Jev 在发请求前返回 `unsupported_usage` 或被其他兼容候选替代。
@@ -70,24 +72,24 @@ curl http://127.0.0.1:8787/v1/decisions \
 }
 ```
 
-OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若上游提供 `cached_tokens`，则保留该明细而不补 `cache_write_tokens`。上游 cost 存在时保留为 `usage.decora.provider_cost`。依赖精确 OpenAI usage schema 的客户端请启用 strict，而不是将省略值解释为 0。
+OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若上游提供 `cached_tokens`，则保留该明细而不补 `cache_write_tokens`。上游 cost 存在时保留为 `usage.decora.provider_cost`。需要精确 OpenAI usage schema 的部署可由管理员配置 strict；客户端不应将省略值解释为 0。
 
-### 角色、JSON 与有类型选项
+### 网关内部的角色、JSON 与有类型选项转换
 
-`native_input_policy` 独立于 usage 策略，**不改变 OpenAI adapter 的原始结构**。
+**客户端始终发送标准 Decisions 请求；下面仅说明内部实现，不是额外 API、请求选项或调用前置要求。** 对合法且已可映射的角色、JSON 和 typed choice，不会再因为需要内部编码而拒绝。
 
-- `textual`（默认）：OpenRouter/Jev 收到字符串 input 时原样使用；消息数组被编码为 JSON 文本，放在官方允许的字符串 `state` 中。保留 system/developer/user/assistant 角色标签、顺序、phase、字符串或内容数组、空内容、Unicode，以及 `input_json.data` 的嵌套 JSON 语义。
-- 题目 instructions 为字符串时原样使用；为 text/JSON 内容数组时采用相同编码放入原生 instructions，不混入聊天 messages 协议。
-- `strict`：禁止上述结构化输入的文本降级，提前返回 `unsupported_textual_lowering` 或选择兼容 OpenAI 候选。它不禁止可逆的 typed choice 映射。
-- `capabilities.messages / json_input / typed_choices` 默认均为 true，可逐项设 false 让路由过滤该能力。
+- OpenAI adapter 保留原始 input/questions 结构。
+- OpenRouter/Jev 的字符串 input 原样转换；消息数组自动编码为有边界的 JSON 文本，放在官方允许的内部 state 中，保留四种合法角色、顺序、phase、空内容、Unicode 和嵌套 JSON。
+- instructions 字符串原样转换；text/JSON 内容数组自动编码，不要求客户端扁平化数据或选择协议。
+- 不提供输入转换策略或角色/JSON/typed choice 能力开关；图片、题型、题数、缓存与安全标识等真实能力仍独立检查。
 
-消息编码结构如下；**整个对象序列化成一个字符串**作为 native state，`data` 的边界通过 JSON 转义保留。题目内容使用 `kind: question_content`。
+内部消息编码如下；**整个对象序列化成一个字符串**供上游使用，客户端无需生成它。题目内容内部使用 `kind: question_content`。
 
 ```json
 {"decora_encoding":"openai_decisions_text_v1","kind":"messages","data":[{"role":"system","content":"系统标签"},{"role":"user","content":[{"type":"input_json","data":{"ok":false,"nested":[1,"中文"]}}]}]}
 ```
 
-这保留了角色标签和数据，**不等于上游原生执行 OpenAI 的角色指令优先级**。JSON 数据边界也不是 prompt injection 隔离：模型仍可能受内容中的恶意指令影响。需要原生层级语义时用 OpenAI 或启用 input strict。
+这保留了角色标签和数据，**不等于上游原生执行 OpenAI 的角色指令优先级**。JSON 数据边界也不是 prompt injection 隔离：模型仍可能受内容中的恶意指令影响。这是后端语义差异，不是客户端可切换的输入格式；要求原生层级语义的部署应由管理员配置合适的上游。
 
 布尔 choice 与字符串可混用，包括 `true` / `"true"`、`false` / `"false"`。只要一组选项含布尔值，该组**所有选项**统一改用内部 `decora_choice_0...` 键，criteria 中保留原始 JSON 类型的 value 和 description。返回的 choice 与各概率 value 按映射还原；布尔 false 不作为缺省值。即使客户端字符串本身等于某个内部键，也不会碰撞；纯字符串组选项继续使用原字符串键。
 
@@ -125,7 +127,6 @@ curl http://127.0.0.1:8787/v1/decisions \
 listen: 127.0.0.1:8787
 bearer_key_env: DECORA_BEARER_KEY
 usage_policy: compatible
-native_input_policy: textual  # strict 可禁止角色/JSON 内容的文本降级
 backends:
   jev-official:
     kind: typesafe
@@ -135,16 +136,13 @@ backends:
     weight: 1
     capabilities:
       question_types: [predicate, choice, score]
-      messages: true      # 默认 true；在此 adapter 中是文本编码而非原生角色层级
-      json_input: true    # 默认 true；保留嵌套 JSON 语义
-      typed_choices: true # 默认 true；混合布尔/字符串选项可逆映射
       images: false
       max_questions: 400
 models:
   decora-jev: [jev-official]
 ```
 
-例如向上述 TypeSafe 配置发送角色消息、题内 JSON 和混合 typed choice：
+下面仍是同一种 OpenAI Decisions 请求，发送角色消息、题内 JSON 和混合 typed choice；`decora-jev` 只是示例公开 alias，不是 Jev 格式入口。管理员换上游时可以沿用原 alias，客户端请求无需改写：
 
 ```bash
 curl http://127.0.0.1:8787/v1/decisions \
@@ -162,7 +160,7 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID（官方示例为 `typesafe/jev-1.13`）和 `api_key_env: OPENROUTER_API_KEY`。默认入口分别为 `https://api.typesafe.ai/v1/systemone`、`https://openrouter.ai/api/alpha/decisions`；无需配置 endpoint。也可把多个后端 ID 放在同一 alias 中实现跨协议回退。
 
-1. 先根据请求实际需要的题型、图片、消息、JSON、缓存、安全标识及题数过滤候选。
+1. 根据题型、图片、缓存、安全标识、题数及服务端 usage 要求筛选候选；合法角色消息、JSON parts 和 typed choice 自动适配，不因内部转换格式过滤。
 2. `priority` 越小越优先；同一优先级按 `weight` **加权无放回**排列，低优先候选排在后面。
 3. 每个请求最多 `max_attempts` 次**总调用**，包括首次；候选全部尝试完后可从该次排列首位开始下一轮。没有运行时模型发现或后台探测。
 4. 仅连接失败、发送阶段超时、HTTP `429/500/502/503/504` 允许按候选顺序回退或重试；等待带有界指数退避及抖动。
@@ -181,7 +179,7 @@ OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID�
 - 日志只记录固定消息、尝试次数和固定错误码；不记录输入、问题、响应正文、密钥、上游 URL、alias 或 YAML 内容。启动器固定启用 `decora=info`，不会接受 `RUST_LOG` 开启 HTTP 客户端的敏感 debug 日志。
 - 对外错误统一采用 `{"error":{"message":...,"type":...,"param":null,"code":...}}`，不回显上游错误正文。
 
-常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_native_images`、`unsupported_textual_lowering`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
+常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_native_images`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
 
 ## 离线验证
 
@@ -194,7 +192,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 2026-11-04 实际结果：**34 项测试通过**（1 项单测 + 33 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
 
-测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、三类上游的三题型 HTTP 往返、OpenRouter→TypeSafe 实际协议回退、默认 compatible 与 strict 策略、TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
+测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、三类上游的三题型 HTTP 往返、所有后端 alias 使用相同 OpenAI 请求和核心 answers 的回归、上游专有请求形状拒绝、OpenRouter→TypeSafe 实际协议回退、服务端 usage compatible/strict 选项、TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
 
 ## 上线前需要完成
 

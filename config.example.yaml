@@ -5,8 +5,7 @@ allow_public_bind: false
 bearer_key_env: DECORA_BEARER_KEY
 usage_policy: compatible  # 默认；只输出真实已知 usage，缺失明细省略，usage.decora 标记口径
 # usage_policy: strict    # 要求完整精确的 OpenAI usage；提前排除 OpenRouter/Jev
-native_input_policy: textual # 默认；角色/JSON 内容编码为带边界的 JSON 文本，不保证角色指令层级
-# native_input_policy: strict # 禁止结构化输入的文本降级；不禁止可逆 typed choice 映射
+# 所有公开 alias 均接收同一种 OpenAI Decisions 请求；内部转换无需客户端或配置选择。
 allow_http_loopback: false  # 只供本机 mock 使用；不是允许任意 HTTP 上游
 max_body_bytes: 8388608
 max_response_bytes: 8388608
@@ -26,10 +25,7 @@ backends:
     weight: 1   # 同优先级按权重无放回排列
     capabilities:
       question_types: [predicate, choice, score]
-      messages: true
       images: true
-      json_input: true
-      typed_choices: true
       prompt_cache: true
       safety_identifier: true
       max_questions: 400
@@ -39,7 +35,7 @@ models:
   decora-luna: [openai-primary]
 
 # 可在 backends/models 中添加以下原生上游；默认支持文本、角色消息、JSON 和混合 typed choice。
-# messages/json_input/typed_choices 默认 true，可显式 false 禁止对应能力；images 默认 false。
+# 角色/JSON/typed choice 自动内部适配，没有格式开关；images 等真实能力仍需声明。
 # 角色文本编码保留标签/顺序，不等于原生 OpenAI 指令层级，也不是 prompt injection 隔离。
 # 未知缓存/推理 token 不填 0；TypeSafe billable input 明确写入 usage.decora。
 # strict 模式会提前返回 unsupported_usage；不会为获取缺失明细而付费调用。
@@ -53,9 +49,6 @@ models:
 #     weight: 1
 #     capabilities:
 #       question_types: [predicate, choice, score]
-#       messages: true
-#       json_input: true
-#       typed_choices: true
 #       images: false
 #       max_questions: 400
 #   router-jev:
@@ -66,9 +59,6 @@ models:
 #     weight: 1
 #     capabilities:
 #       question_types: [predicate, choice, score]
-#       messages: true
-#       json_input: true
-#       typed_choices: true
 #       images: false
 #       max_questions: 400
 # models 中可添加

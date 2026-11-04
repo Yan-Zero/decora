@@ -1,6 +1,6 @@
 //! 官方原生协议映射：默认保留真实可用 usage；严格模式拒绝口径或必需明细差异。
 use crate::{
-    config::{Backend, BackendKind, NativeInputPolicy, UsagePolicy},
+    config::{Backend, BackendKind, UsagePolicy},
     error::ApiError,
     protocol::{Answer, ChoiceValue, DecisionRequest, DecisionResponse, Question, Requirements},
 };
@@ -12,7 +12,6 @@ pub fn compatible(
     req: &DecisionRequest,
     need: &Requirements,
     usage_policy: UsagePolicy,
-    input_policy: NativeInputPolicy,
 ) -> Result<(), ApiError> {
     let c = &backend.capabilities;
     if req.questions.len() > c.max_questions
@@ -21,34 +20,25 @@ pub fn compatible(
             .iter()
             .any(|q| !c.question_types.iter().any(|t| t == q.kind()))
         || (need.images > 0 && !c.images)
-        || (need.json && !c.json_input)
-        || (need.messages && !c.messages)
         || (need.cache && !c.prompt_cache)
         || (need.safety && !c.safety_identifier)
-        || (!c.typed_choices && has_boolean_choices(req))
     {
         return Err(ApiError::unsupported("unsupported_capability"));
     }
     if backend.kind != BackendKind::Openai {
-        validate_native_request(req, input_policy)?;
+        validate_native_request(req)?;
         if usage_policy == UsagePolicy::Strict {
             return Err(ApiError::unsupported("unsupported_usage"));
         }
     }
     Ok(())
 }
-fn has_boolean_choices(req: &DecisionRequest) -> bool {
-    req.questions.iter().any(|q| matches!(q, Question::Choice { choices, .. } if choices.iter().any(|c| matches!(c.value, ChoiceValue::Bool(_)))))
-}
 fn parts_have_images(value: &Value) -> bool {
     value
         .as_array()
         .is_some_and(|parts| parts.iter().any(|p| p["type"] == "input_image"))
 }
-fn validate_native_request(
-    req: &DecisionRequest,
-    policy: NativeInputPolicy,
-) -> Result<(), ApiError> {
+fn validate_native_request(req: &DecisionRequest) -> Result<(), ApiError> {
     // 只检查真正的内容 part，不把 input_json.data 中同名字段当图片。
     let images = req
         .input
@@ -78,11 +68,6 @@ fn validate_native_request(
     {
         return Err(ApiError::unsupported("unsupported_native_mapping"));
     }
-    if policy == NativeInputPolicy::Strict
-        && (!req.input.is_string() || req.questions.iter().any(|q| !q.instructions().is_string()))
-    {
-        return Err(ApiError::unsupported("unsupported_textual_lowering"));
-    }
     Ok(())
 }
 fn choice_key(choices: &[crate::protocol::ChoiceOption], index: usize) -> String {
@@ -108,18 +93,10 @@ fn textual(value: &Value, kind: &str) -> Value {
         json!({"decora_encoding":"openai_decisions_text_v1","kind":kind,"data":value}).to_string()
     )
 }
-/// 默认将角色/JSON 内容编码成结构化文本，保留数据而不冒充原生角色指令层级。
-/// 真实图片、缓存及 safety 参数仍须有独立协议支持，不能藏在文本中发送。
+/// 自动将固定 OpenAI 请求转换为上游原生 body；转换是网关内部实现，不是客户端 API。
+/// 角色/JSON 编码保留数据，不冒充原生角色指令层级；真实图片、缓存和 safety 仍独立筛选。
 pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError> {
-    native_body_with_policy(req, model, NativeInputPolicy::Textual)
-}
-/// 按配置策略生成官方 native 请求；strict 禁止结构化输入的文本降级。
-pub fn native_body_with_policy(
-    req: &DecisionRequest,
-    model: &str,
-    policy: NativeInputPolicy,
-) -> Result<Value, ApiError> {
-    validate_native_request(req, policy)?;
+    validate_native_request(req)?;
     let mut questions = Map::new();
     for (index, q) in req.questions.iter().enumerate() {
         let mut question = json!({"type": q.kind(), "instructions": textual(q.instructions(), "question_content")});

@@ -2,6 +2,8 @@
 
 核对日期：**2026-11-04**。实现以官方 schema 为准，不把名称相似的第三方网关、博客或聊天 structured output 当作原生决策接口。
 
+**外部只有固定 OpenAI Decisions 请求与核心 answers 合同**：所有公开 alias 都调用同一个 `/v1/decisions`，客户端不选择转换策略、不改为 state/criteria 等上游格式。以下上游映射和编码均为网关内部实现说明，不是额外公开 API。**当前整个响应仍有明确例外：compatible usage 可省略 OpenAI 必需明细并增加 usage.decora 扩展，尚不严格完全符合 OpenAI schema。** 本轮保留该服务端管理行为，不伪造未知零值。
+
 ## 1. 官方来源
 
 | 提供方 | 文档 | 机器可读 schema | 原生 POST 入口 |
@@ -103,7 +105,7 @@ TypeSafe openapi.json
 | 布尔/字符串混合 choice | 支持原生类型区别 | 全组内部索引键，保留原值/描述，答案准确还原类型 | 同左 |
 | 纯文本 score | 原样，有序 labels/description | levels→criteria 数组；legend/概率索引→原标签 | 同左 |
 | 重复/省略 name | 支持 | 内部 q0/q1 键，还原原始名字和题序 | 同左 |
-| 角色消息 / JSON parts | 原结构及原生角色约束 | 默认文本编码保留角色/顺序/JSON；input strict 可禁止降级 | 同左 |
+| 角色消息 / JSON parts | 原结构及原生角色约束 | 自动内部编码保留角色/顺序/JSON，无客户端格式或转换开关 | 同左 |
 | 原生角色指令层级 | 由 OpenAI 执行 | 文本标签不提供原生层级保证 | 同左 |
 | input / question 图片 | 支持；共享总计数限制 | 提前过滤，可选择其他兼容候选 | 同左，不启用 danger-zone |
 | refusal | 支持，保留，绝不回退 | 官方答案 union 无 refusal；不虚构映射，未知类型报错且不回退 | 同左 |
@@ -112,7 +114,7 @@ TypeSafe openapi.json
 | usage 口径标记 | 原生 OpenAI 合同，无扩展 | usage.decora 标记 provider_reported | usage.decora 标记 billable_input |
 | 校准质量保证 | 透传原生估计，不作额外保证 | 同左，无聊天 JSON 代替 | 同左 |
 
-### usage_policy: compatible（默认）
+### 服务端管理选项 usage_policy: compatible（默认）
 
 OpenRouter 官方 `DecisionsResponse.usage` 必需 input/output token，可选 cost 和 `input_tokens_details.cached_tokens`；该 details 对象存在时官方要求 cached_tokens。TypeSafe 官方 `Usage` 只有 input/output token，input_tokens 明确是 **billable input tokens**。这些缺失不会阻止核心题型调用：
 
@@ -139,7 +141,7 @@ TypeSafe 的兼容响应示例
 
 这里的 132 是**计费输入加输出**，不能用于宣称 OpenAI 精确总 token、完整上下文长度或跨上游等口径成本。OpenRouter 对应标记为 `provider: openrouter`、`input_tokens_basis: provider_reported`、`total_tokens_basis: provider_input_plus_output`。`details_complete` 仅说明三个已知细分字段是否都存在，不表示不同上游计数口径相同，也不是校准或计费认证。
 
-### usage_policy: strict（可选）
+### 服务端管理选项 usage_policy: strict（可选）
 
 要求完整 OpenAI usage 与计数口径，不添加兼容扩展。由于官方合同缺少明细或 input 语义不同，运行时在网络调用前排除 OpenRouter/TypeSafe；若 alias 只剩这些候选，返回 `400 unsupported_usage`。若有兼容 OpenAI 候选则继续路由它。默认 compatible 和 strict 使用完全相同的概率、confidence、评分期望、拒答和重试规则。
 
@@ -153,23 +155,24 @@ TypeSafe 的兼容响应示例
 - TypeSafe 图片依赖 assets 和 `TypeSafe-Danger-Zone-Images: true`；OpenRouter 图片存在 provider 和引用位置差异。本版不做这些跨协议多模态转换，提前过滤，不会在不支持的上游上付费试错。
 - 不实现 box，因为 OpenAI 目标合同没有这个题型。官方未定义的 native refusal 不映射成 0/false，不盲目换模型。
 
-若依赖完整 OpenAI SDK 的固定 usage 明细，请选择 strict；可处理部分 usage 的客户端应使用默认 compatible，并读取 `usage.decora` 判断统计口径。
+需要严格完整 usage 的部署可由管理员配置 usage strict；客户端仍使用同一请求格式，不选择上游协议。compatible 下必须认识到省略必需明细及 `usage.decora` 是当前外部 schema 偏差，不能将未知值补 0 或宣称整个响应完全符合 OpenAI。
 
-## 4. 角色、JSON 与 typed choice 的显式适配
+## 4. 固定外部合同下的内部自动适配
 
-### 输入策略及能力
+### 请求与核心答案不因上游而变
 
-`native_input_policy: textual` 为默认，只作用于 OpenRouter/TypeSafe；OpenAI 始终保留原始 input/questions 结构。
+所有公开 alias 都使用 OpenAI 的 model/input/questions 及 answers 数组；转换是网关职责，不是客户端需选择的协议。OpenAI 走原始结构分支，OpenRouter/TypeSafe 自动使用下述内部映射。没有输入转换策略、角色/JSON/typed choice 开关，合法且可映射的请求不会只因需要内部编码而 unsupported。
 
 - 消息数组按官方 OpenAI 已验证 schema 接收，角色仅为 system/developer/user/assistant，保留原顺序、标签、phase 及 content 的字符串/数组形态。不会添加自定义角色，也不擅加 Decisions 不支持的 name 等消息字段。
 - 字符串内容，包括空字符串，原样保留；内容数组中的 input_text/output_text/refusal 及 input_json.data 作为数据完整编码。允许空消息数组、空 content 数组、Unicode 与嵌套 JSON；仍受原请求的长度/JSON 深度等限制。
-- instructions 是字符串时原样使用；是 text/JSON 内容数组时编码到 native questions.qN.instructions。predicate/choice/score 共用此规则，题内 JSON 不丢失。
-- `capabilities.messages / json_input / typed_choices` 默认均为 true，可逐项设 false 禁止该候选承接对应请求。
-- `native_input_policy: strict` 在网络调用前禁止消息/内容数组的文本降级，返回 unsupported_textual_lowering 或选择其他兼容候选。它不禁止可逆 typed choice 映射。此开关与 usage_policy 完全独立。
+- instructions 是字符串时原样使用；是 text/JSON 内容数组时自动内部编码。predicate/choice/score 共用此规则，题内 JSON 不丢失。
+- 布尔/字符串混合 choice 自动可逆映射；返回 choice 与概率 value 保持原始 OpenAI 类型，不把内部选项 ID 当作答案。
+- 图片、题型、题数、缓存及安全标识等真实能力仍筛选；usage 管理要求仍是独立的现存服务端选项。
+- 客户端发送上游 state/命名 questions 或转换控制字段会被当作非法请求，不构成另一套 API。
 
 ### 明确的编码与语义边界
 
-消息数组转换为以下 JSON 对象的**字符串序列化**，置于 native state；题目内容使用相同封装，kind 为 question_content，置于 native instructions。
+网关内部自动将消息数组转换为以下 JSON 对象的**字符串序列化**并发送上游；题目内容使用相同封装，kind 为 question_content。客户端不生成或提交这种封装，也不提交 native state/instructions 形状。
 
 ```json
 {
@@ -179,7 +182,7 @@ TypeSafe 的兼容响应示例
 }
 ```
 
-JSON 转义明确 data 边界，保留原数据的 JSON 类型和语义，而非拼接未经转义的分隔标签。对象键顺序不作为 JSON 语义承诺；不保留用户原始 JSON 的空白/字节格式。角色标签及顺序仍可被模型读取，但**上游没有原生执行 OpenAI 的角色指令层级**；只保留数据不等于同等指令约束。该编码也不是 prompt injection 安全隔离，模型仍可能遵从数据中的恶意指令。需要原生角色层级时应选择 OpenAI，或用 input strict 排除这种转换。
+JSON 转义明确 data 边界，保留原数据的 JSON 类型和语义，而非拼接未经转义的分隔标签。对象键顺序不作为 JSON 语义承诺；不保留用户原始 JSON 的空白/字节格式。角色标签及顺序仍可被模型读取，但**上游没有原生执行 OpenAI 的角色指令层级**；只保留数据不等于同等指令约束。该编码也不是 prompt injection 安全隔离，模型仍可能遵从数据中的恶意指令。这是实际后端语义差异，要求原生角色层级的部署应由管理员选择合适的后端，而不是要求客户端更换请求格式。
 
 真实 input_image 在编码前单独检查，即使管理员把 native 的 images 声明为 true，也不能绕过 adapter 的图片边界。共享输入和题目图片都提前排除，不把图片 URL 当已分析的视觉证据。input_json.data 中叫 role/type/image_url 的普通键保留为数据，不会触发图片处理或创建新角色。缓存断点和 safety 参数仍不做文本降级。
 

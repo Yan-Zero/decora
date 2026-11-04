@@ -119,7 +119,7 @@ fn success() -> Value {
     json!({"model":"gpt-6-luna","answers":[{"type":"predicate","name":null,"probability":0.8}],"usage":usage()})
 }
 fn backend(url: &str, priority: u32) -> Value {
-    json!({"kind":"openai","model":"gpt-6-luna","api_key_env":"TEST_UPSTREAM_KEY","endpoint":url,"priority":priority,"weight":1,"capabilities":{"question_types":["predicate","choice","score"],"images":true,"messages":true,"json_input":true,"prompt_cache":true,"safety_identifier":true,"max_questions":400}})
+    json!({"kind":"openai","model":"gpt-6-luna","api_key_env":"TEST_UPSTREAM_KEY","endpoint":url,"priority":priority,"weight":1,"capabilities":{"question_types":["predicate","choice","score"],"images":true,"prompt_cache":true,"safety_identifier":true,"max_questions":400}})
 }
 fn config_value(backends: Value) -> Value {
     let ids: Vec<String> = backends.as_object().unwrap().keys().cloned().collect();
@@ -914,12 +914,7 @@ async fn native_to_native_fallback_uses_each_backends_real_protocol() {
 async fn strict_usage_policy_and_native_multimodal_boundaries_filter_before_network() {
     for kind in ["typesafe", "openrouter"] {
         let native = Mock::new(vec![]).await;
-        let openai = Mock::new(vec![
-            Reply::ok(success()),
-            Reply::ok(success()),
-            Reply::ok(success()),
-        ])
-        .await;
+        let openai = Mock::new(vec![Reply::ok(success()), Reply::ok(success())]).await;
         let base = config_value(
             json!({"a":native_backend(&native.url,kind,0),"b":backend(&openai.url,1)}),
         );
@@ -929,24 +924,8 @@ async fn strict_usage_policy_and_native_multimodal_boundaries_filter_before_netw
         let mut image = predicate();
         image["input"] = json!([{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}]);
         assert_eq!(call(&gateway(base.clone()), image).await.0, StatusCode::OK);
-        let mut instructions = predicate();
-        instructions["questions"][0]["instructions"] = json!([{"type":"input_text","text":"问题"}]);
-        let mut strict_input = base;
-        strict_input["native_input_policy"] = json!("strict");
-        assert_eq!(
-            call(&gateway(strict_input), instructions).await.0,
-            StatusCode::OK
-        );
         assert_eq!(native.count(), 0);
-        assert_eq!(openai.count(), 3);
-        let mut cfg = config_value(json!({"a":native_backend(&native.url,kind,0)}));
-        cfg["backends"]["a"]["capabilities"]["typed_choices"] = json!(false);
-        let mut boolean = predicate();
-        boolean["questions"] = json!([{"type":"choice","instructions":"选项","choices":[{"value":true},{"value":"true"}]}]);
-        let (s, _, v) = call(&gateway(cfg), boolean).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert_eq!(v["error"]["code"], "unsupported_capability");
-        assert_eq!(native.count(), 0);
+        assert_eq!(openai.count(), 2);
     }
 }
 
@@ -1290,24 +1269,56 @@ async fn invalid_typed_choice_keys_are_protocol_errors_without_fallback() {
 }
 
 #[tokio::test]
-async fn native_input_strict_is_independent_of_typed_choice_and_usage_policies() {
-    for kind in ["typesafe", "openrouter"] {
-        let upstream = Mock::new(vec![Reply::ok(typed_native_response(2))]).await;
-        let mut cfg = config_value(json!({"a":minimal_native_backend(&upstream.url,kind)}));
-        cfg["native_input_policy"] = json!("strict");
-        let gw = gateway(cfg);
-        for request in [
-            json!({"model":"decora-test","input":[{"role":"user","content":"x"}],"questions":[{"type":"predicate","instructions":"q"}]}),
-            json!({"model":"decora-test","input":"x","questions":[{"type":"predicate","instructions":[{"type":"input_json","data":{"x":false}}]}]}),
-        ] {
-            let (s, _, v) = call(&gw, request).await;
-            assert_eq!(s, StatusCode::BAD_REQUEST);
-            assert_eq!(v["error"]["code"], "unsupported_textual_lowering");
+async fn identical_openai_request_and_answers_contract_for_every_backend_alias() {
+    let mut request = typed_choice_request();
+    request["input"] = json!([{"role":"system","content":"同一公开合同"},{"role":"user","content":[{"type":"input_json","data":{"flag":false,"text":"true"}}]}]);
+    request["questions"][0]["instructions"] = json!([{"type":"input_text","text":"按类型选择"},{"type":"input_json","data":{"field":"flag"}}]);
+    let probabilities: Vec<Value> = (0..6).map(|i| json!({"value":request["questions"][0]["choices"][i]["value"],"probability":if i == 2 { 0.75 } else { 0.05 }})).collect();
+    let answers = json!([{"type":"choice","name":"typed","choice":false,"confidence":0.6,"probabilities":probabilities}]);
+    for (kind, path) in [
+        ("openai", "/v1/decisions"),
+        ("openrouter", "/api/alpha/decisions"),
+        ("typesafe", "/v1/systemone"),
+    ] {
+        let response = if kind == "openai" {
+            json!({"model":"resolved","answers":answers,"usage":usage()})
+        } else {
+            typed_native_response(2)
+        };
+        let upstream = Mock::at(path, vec![Reply::ok(response)]).await;
+        let gw = gateway(config_value(
+            json!({"backend":minimal_native_backend(&upstream.url,kind)}),
+        ));
+        let (s, _, v) = call(&gw, request.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{kind}: {v}");
+        assert_eq!(v["model"], request["model"]);
+        assert_eq!(v["answers"], answers);
+        assert_eq!(
+            v.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+            vec!["answers", "model", "usage"]
+        );
+        assert!(v.get("state").is_none());
+        assert!(v.get("native_input_policy").is_none());
+        // 本轮只统一请求与核心 answers；兼容 usage 扩展仍是明确保留的合同差异。
+        if kind == "openai" {
+            assert!(v["usage"].get("decora").is_none());
+        } else {
+            assert_eq!(v["usage"]["decora"]["provider"], kind);
+            assert!(v["usage"].get("input_tokens_details").is_none());
         }
-        assert_eq!(upstream.count(), 0);
-        let (s, _, v) = call(&gw, typed_choice_request()).await;
-        assert_eq!(s, StatusCode::OK);
-        assert_eq!(v["answers"][0]["choice"], false);
+        // 上游专有请求形状不成为额外公开 API；转换设置也不能由客户端传入。
+        for invalid in [
+            json!({"model":"decora-test","state":"x","questions":{"q0":{"type":"noul","instructions":"q"}}}),
+            {
+                let mut invalid = request.clone();
+                invalid["native_input_policy"] = json!("strict");
+                invalid
+            },
+        ] {
+            let (status, _, error) = call(&gw, invalid).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["code"], "invalid_request");
+        }
         assert_eq!(upstream.count(), 1);
     }
 }
@@ -1340,34 +1351,14 @@ async fn native_actual_images_are_never_hidden_inside_textual_lowering() {
 }
 
 #[tokio::test]
-async fn lowering_capabilities_can_be_disabled_and_openai_keeps_original_structures() {
-    for (capability, request) in [
-        (
-            "messages",
-            json!({"model":"decora-test","input":[{"role":"user","content":"x"}],"questions":[{"type":"predicate","instructions":"q"}]}),
-        ),
-        (
-            "json_input",
-            json!({"model":"decora-test","input":"x","questions":[{"type":"predicate","instructions":[{"type":"input_json","data":{"x":1}}]}]}),
-        ),
-        ("typed_choices", typed_choice_request()),
-    ] {
-        let upstream = Mock::new(vec![]).await;
-        let mut cfg = config_value(json!({"a":minimal_native_backend(&upstream.url,"typesafe")}));
-        cfg["backends"]["a"]["capabilities"][capability] = json!(false);
-        let (s, _, v) = call(&gateway(cfg), request).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert_eq!(v["error"]["code"], "unsupported_capability");
-        assert_eq!(upstream.count(), 0);
-    }
+async fn openai_keeps_original_structures_after_internal_conversion_cleanup() {
     let mut request = typed_choice_request();
     request["input"] = json!([{"role":"system","content":"原生系统指令"},{"role":"user","content":[{"type":"input_json","data":{"x":[false,"true"]}}]}]);
     request["questions"][0]["instructions"] =
         json!([{"type":"input_text","text":"任务"},{"type":"input_json","data":{"key":null}}]);
     let probabilities: Vec<Value> = (0..6).map(|i| json!({"value":request["questions"][0]["choices"][i]["value"],"probability":if i == 2 { 0.75 } else { 0.05 }})).collect();
     let upstream = Mock::new(vec![Reply::ok(json!({"model":"openai","answers":[{"type":"choice","name":"typed","choice":false,"confidence":0.6,"probabilities":probabilities}],"usage":usage()}))]).await;
-    let mut cfg = config_value(json!({"a":backend(&upstream.url,0)}));
-    cfg["native_input_policy"] = json!("strict");
+    let cfg = config_value(json!({"a":backend(&upstream.url,0)}));
     let (s, _, v) = call(&gateway(cfg), request.clone()).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["answers"][0]["choice"], false);
@@ -1378,7 +1369,7 @@ async fn lowering_capabilities_can_be_disabled_and_openai_keeps_original_structu
 
 #[test]
 fn official_native_endpoints_and_usage_policy_are_explicit() {
-    use decora::config::{BackendKind, NativeInputPolicy, UsagePolicy};
+    use decora::config::{BackendKind, UsagePolicy};
     assert_eq!(
         BackendKind::Typesafe.endpoint(),
         "https://api.typesafe.ai/v1/systemone"
@@ -1390,13 +1381,17 @@ fn official_native_endpoints_and_usage_policy_are_explicit() {
     let cfg = config_value(json!({"a":backend("http://127.0.0.1:1234/decisions",0)}));
     let parsed = Config::from_yaml(&cfg.to_string()).unwrap();
     assert!(parsed.usage_policy == UsagePolicy::Compatible);
-    assert!(parsed.native_input_policy == NativeInputPolicy::Textual);
     let mut bad = cfg.clone();
     bad["usage_policy"] = json!("guess_zero");
     assert!(Config::from_yaml(&bad.to_string()).is_err());
-    let mut bad = cfg;
-    bad["native_input_policy"] = json!("invent_roles");
+    let mut bad = cfg.clone();
+    bad["native_input_policy"] = json!("textual");
     assert!(Config::from_yaml(&bad.to_string()).is_err());
+    for field in ["messages", "json_input", "typed_choices"] {
+        let mut bad = cfg.clone();
+        bad["backends"]["a"]["capabilities"][field] = json!(false);
+        assert!(Config::from_yaml(&bad.to_string()).is_err());
+    }
 }
 
 #[test]
