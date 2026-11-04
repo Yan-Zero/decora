@@ -3,6 +3,8 @@
 listen: 127.0.0.1:8787
 allow_public_bind: false
 bearer_key_env: DECORA_BEARER_KEY
+usage_policy: compatible  # 默认；只输出真实已知 usage，缺失明细省略，usage.decora 标记口径
+# usage_policy: strict    # 要求完整精确的 OpenAI usage；提前排除 OpenRouter/Jev
 allow_http_loopback: false  # 只供本机 mock 使用；不是允许任意 HTTP 上游
 max_body_bytes: 8388608
 max_response_bytes: 8388608
@@ -33,9 +35,10 @@ backends:
 models:
   decora-luna: [openai-primary]
 
-# OpenRouter 和 TypeSafe/Jev 的官方 schema 已核实，但无法提供完整 OpenAI usage。
-# 当前严格接口下不可用，选中时提前返回 unsupported_usage，不发出付费请求。
-# 若要验证错误分支，可添加以下候选和公开 alias；启动也会要求该环境变量。
+# 可在 backends/models 中添加以下原生上游；compatible 模式下纯文本三题型可用。
+# 未知缓存/推理 token 不填 0；TypeSafe billable input 明确写入 usage.decora。
+# strict 模式会提前返回 unsupported_usage；不会为获取缺失明细而付费调用。
+# 只配置实际使用的后端；启动时会要求所有已配置后端的凭据环境变量。
 # backends 中可添加
 #   jev-official:
 #     kind: typesafe
@@ -56,4 +59,6 @@ models:
 #       question_types: [predicate, choice, score]
 #       max_questions: 400
 # models 中可添加
-#   jev-unavailable: [jev-official]
+#   decora-jev: [jev-official]
+#   decora-router: [router-jev]
+#   decora-text-auto: [router-jev, jev-official, openai-primary]

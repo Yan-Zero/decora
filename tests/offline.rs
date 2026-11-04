@@ -62,6 +62,9 @@ impl Drop for Mock {
 }
 impl Mock {
     async fn new(replies: Vec<Reply>) -> Self {
+        Self::at("/decisions", replies).await
+    }
+    async fn at(path: &str, replies: Vec<Reply>) -> Self {
         async fn handler(
             State(state): State<Arc<MockState>>,
             headers: HeaderMap,
@@ -93,9 +96,9 @@ impl Mock {
             ..Default::default()
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/decisions", listener.local_addr().unwrap());
+        let url = format!("http://{}{path}", listener.local_addr().unwrap());
         let app = Router::new()
-            .route("/decisions", post(handler))
+            .route(path, post(handler))
             .with_state(state.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -436,7 +439,9 @@ async fn image_limits_body_limits_unknown_models_and_unsupported_do_not_call_ups
     for kind in ["typesafe", "openrouter"] {
         let mut b = backend(&source.url, 0);
         b["kind"] = json!(kind);
-        let gw = gateway(config_value(json!({"native":b})));
+        let mut cfg = config_value(json!({"native":b}));
+        cfg["usage_policy"] = json!("strict");
+        let gw = gateway(cfg);
         let (s, _, v) = call(&gw, predicate()).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"]["code"], "unsupported_usage");
@@ -781,6 +786,295 @@ async fn no_compatible_candidate_is_contacted_and_mixed_refusal_is_preserved() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["answers"], response["answers"]);
     assert_eq!(upstream.count(), 1);
+}
+
+fn native_request_three() -> Value {
+    json!({"model":"decora-test","input":"工单内容","questions":[
+        {"type":"predicate","name":"same","instructions":"是否涉及账单？"},
+        {"type":"choice","name":"same","instructions":"分配团队","choices":[{"value":"a","description":"团队A"},{"value":"b"}]},
+        {"type":"score","instructions":"紧迫性","levels":[{"label":"低"},{"label":"高","description":"今天处理"}]}
+    ]})
+}
+fn native_success_three() -> Value {
+    json!({"model":"jev-resolved","answers":{
+        "q2":{"type":"score","score":0.8,"confidence":0.5,"legend":{"0":"低","1":{"label":"高","description":"今天处理"}},"probabilities":{"0":0.2,"1":0.8}},
+        "q0":{"type":"noul","noul":0.9},
+        "q1":{"type":"choice","choice":"a","confidence":0.3,"probabilities":{"a":0.7,"b":0.3}}
+    },"usage":{"input_tokens":120,"output_tokens":12}})
+}
+fn native_backend(url: &str, kind: &str, priority: u32) -> Value {
+    let mut b = backend(url, priority);
+    b["kind"] = json!(kind);
+    b["model"] = json!(if kind == "typesafe" {
+        "jev-latest"
+    } else {
+        "typesafe/jev-1.13"
+    });
+    b
+}
+
+#[tokio::test]
+async fn native_http_three_types_work_by_default_with_honest_partial_usage() {
+    for (kind, path) in [
+        ("typesafe", "/v1/systemone"),
+        ("openrouter", "/api/alpha/decisions"),
+    ] {
+        let mut response = native_success_three();
+        if kind == "openrouter" {
+            response["usage"]["input_tokens_details"] = json!({"cached_tokens":30});
+            response["usage"]["cost"] = json!(0.001);
+        }
+        let upstream = Mock::at(path, vec![Reply::ok(response)]).await;
+        let cfg = config_value(json!({"native":native_backend(&upstream.url,kind,0)}));
+        assert!(cfg.get("usage_policy").is_none()); // 真正测试默认 compatible，而不是显式解锁。
+        let (s, _, v) = call(&gateway(cfg), native_request_three()).await;
+        assert_eq!(s, StatusCode::OK, "{kind}: {v}");
+        assert_eq!(v["model"], "decora-test");
+        assert_eq!(
+            v["answers"][0],
+            json!({"type":"predicate","name":"same","probability":0.9})
+        );
+        assert_eq!(v["answers"][1]["name"], "same");
+        assert_eq!(v["answers"][1]["choice"], "a");
+        assert_eq!(v["answers"][1]["confidence"], 0.3);
+        assert_eq!(v["answers"][1]["probabilities"][0]["probability"], 0.7);
+        assert_eq!(v["answers"][2]["score"], 0.8);
+        assert_eq!(v["answers"][2]["probabilities"][1]["label"], "高");
+        assert_eq!(v["usage"]["input_tokens"], 120);
+        assert_eq!(v["usage"]["output_tokens"], 12);
+        assert_eq!(v["usage"]["total_tokens"], 132);
+        assert!(v["usage"].get("output_tokens_details").is_none());
+        assert_eq!(v["usage"]["decora"]["details_complete"], false);
+        assert_eq!(v["usage"]["decora"]["provider"], kind);
+        if kind == "typesafe" {
+            assert!(v["usage"].get("input_tokens_details").is_none());
+            assert_eq!(v["usage"]["decora"]["input_tokens_basis"], "billable_input");
+            assert_eq!(
+                v["usage"]["decora"]["total_tokens_basis"],
+                "billable_input_plus_output"
+            );
+        } else {
+            assert_eq!(
+                v["usage"]["input_tokens_details"],
+                json!({"cached_tokens":30})
+            );
+            assert_eq!(
+                v["usage"]["decora"]["input_tokens_basis"],
+                "provider_reported"
+            );
+            assert_eq!(v["usage"]["decora"]["provider_cost"], 0.001);
+        }
+        let seen = upstream.state.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0["authorization"], "Bearer sk-offline-upstream");
+        assert!(seen[0].0.get("typesafe-danger-zone-images").is_none());
+        assert_eq!(seen[0].1["state"], "工单内容");
+        assert!(seen[0].1.get("input").is_none());
+        assert!(seen[0].1.get("messages").is_none());
+        assert_eq!(seen[0].1["questions"]["q0"]["type"], "noul");
+        assert_eq!(
+            seen[0].1["questions"]["q1"]["criteria"],
+            json!({"a":"团队A","b":null})
+        );
+        assert_eq!(
+            seen[0].1["questions"]["q2"]["criteria"],
+            json!(["低",{"label":"高","description":"今天处理"}])
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_to_native_fallback_uses_each_backends_real_protocol() {
+    let a = Mock::at("/api/alpha/decisions", vec![Reply::status(503)]).await;
+    let b = Mock::at("/v1/systemone", vec![Reply::ok(native_success_three())]).await;
+    let cfg = config_value(
+        json!({"a":native_backend(&a.url,"openrouter",0),"b":native_backend(&b.url,"typesafe",1)}),
+    );
+    let (s, _, v) = call(&gateway(cfg), native_request_three()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(a.count(), 1);
+    assert_eq!(b.count(), 1);
+    assert_eq!(
+        a.state.seen.lock().unwrap()[0].1["model"],
+        "typesafe/jev-1.13"
+    );
+    assert_eq!(b.state.seen.lock().unwrap()[0].1["model"], "jev-latest");
+    assert_eq!(v["usage"]["decora"]["provider"], "typesafe");
+}
+
+#[tokio::test]
+async fn strict_usage_policy_and_native_multimodal_boundaries_filter_before_network() {
+    for kind in ["typesafe", "openrouter"] {
+        let native = Mock::new(vec![]).await;
+        let openai = Mock::new(vec![
+            Reply::ok(success()),
+            Reply::ok(success()),
+            Reply::ok(success()),
+        ])
+        .await;
+        let base = config_value(
+            json!({"a":native_backend(&native.url,kind,0),"b":backend(&openai.url,1)}),
+        );
+        let mut strict = base.clone();
+        strict["usage_policy"] = json!("strict");
+        assert_eq!(call(&gateway(strict), predicate()).await.0, StatusCode::OK);
+        let mut image = predicate();
+        image["input"] = json!([{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}]);
+        assert_eq!(call(&gateway(base.clone()), image).await.0, StatusCode::OK);
+        let mut instructions = predicate();
+        instructions["questions"][0]["instructions"] = json!([{"type":"input_text","text":"问题"}]);
+        assert_eq!(call(&gateway(base), instructions).await.0, StatusCode::OK);
+        assert_eq!(native.count(), 0);
+        assert_eq!(openai.count(), 3);
+        let cfg = config_value(json!({"a":native_backend(&native.url,kind,0)}));
+        let mut boolean = predicate();
+        boolean["questions"] = json!([{"type":"choice","instructions":"选项","choices":[{"value":true},{"value":"true"}]}]);
+        let (s, _, v) = call(&gateway(cfg), boolean).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["code"], "unsupported_boolean_choice");
+        assert_eq!(native.count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn native_invalid_probabilities_refusal_and_usage_are_not_faked_or_retried() {
+    for kind in ["typesafe", "openrouter"] {
+        let mut cases = Vec::new();
+        let mut v = native_success_three();
+        v["answers"]["q0"]["noul"] = json!(1.5);
+        cases.push(v);
+        let mut v = native_success_three();
+        v["answers"]["q1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("confidence");
+        cases.push(v);
+        let mut v = native_success_three();
+        v["answers"]["q1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("probabilities");
+        cases.push(v);
+        let mut v = native_success_three();
+        v["answers"]["q0"] = json!({"type":"refusal"});
+        cases.push(v);
+        let mut v = native_success_three();
+        v["usage"]["input_tokens"] = json!(-1);
+        cases.push(v);
+        let mut v = native_success_three();
+        v["usage"]["output_tokens"] = json!(1.5);
+        cases.push(v);
+        let mut v = native_success_three();
+        v["usage"]["input_tokens"] = json!(i32::MAX);
+        cases.push(v);
+        let mut v = native_success_three();
+        v["usage"].as_object_mut().unwrap().remove("input_tokens");
+        cases.push(v);
+        let mut v = native_success_three();
+        v["usage"]["input_tokens_details"] = json!({"cached_tokens":-1});
+        cases.push(v);
+        if kind == "openrouter" {
+            let mut v = native_success_three();
+            v["usage"]["input_tokens_details"] = json!({"cached_tokens":121});
+            cases.push(v);
+            let mut v = native_success_three();
+            v["usage"]["input_tokens_details"] = json!({});
+            cases.push(v);
+        }
+        let mut v = native_success_three();
+        v["usage"]["total_tokens"] = json!(999);
+        cases.push(v);
+        let mut v = native_success_three();
+        v["usage"]["cost"] = json!(-0.1);
+        cases.push(v);
+        let count = cases.len();
+        let native = Mock::new(cases.into_iter().map(Reply::ok).collect()).await;
+        let fallback = Mock::new(vec![]).await;
+        let gw = gateway(config_value(
+            json!({"a":native_backend(&native.url,kind,0),"b":backend(&fallback.url,1)}),
+        ));
+        for _ in 0..count {
+            let (s, _, v) = call(&gw, native_request_three()).await;
+            assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+            assert_eq!(v["error"]["code"], "upstream_protocol_error");
+        }
+        assert_eq!(native.count(), count);
+        assert_eq!(fallback.count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn native_client_error_does_not_fallback_and_retry_after_can_recover() {
+    for kind in ["typesafe", "openrouter"] {
+        let a = Mock::new(vec![Reply::status(422)]).await;
+        let b = Mock::new(vec![]).await;
+        let gw = gateway(config_value(
+            json!({"a":native_backend(&a.url,kind,0),"b":native_backend(&b.url,kind,1)}),
+        ));
+        let (s, _, v) = call(&gw, native_request_three()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["code"], "upstream_client_error");
+        assert_eq!(b.count(), 0);
+        let mut limited = Reply::status(429);
+        limited.retry = Some("0".into());
+        let a = Mock::new(vec![limited]).await;
+        let b = Mock::new(vec![Reply::ok(native_success_three())]).await;
+        let gw = gateway(config_value(
+            json!({"a":native_backend(&a.url,kind,0),"b":native_backend(&b.url,kind,1)}),
+        ));
+        assert_eq!(call(&gw, native_request_three()).await.0, StatusCode::OK);
+        assert_eq!(a.count(), 1);
+        assert_eq!(b.count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn native_available_detail_values_are_preserved_without_claiming_equal_token_basis() {
+    for kind in ["typesafe", "openrouter"] {
+        let mut raw = native_success_three();
+        let cached = if kind == "typesafe" { 200 } else { 0 };
+        raw["usage"]["input_tokens_details"] =
+            json!({"cached_tokens":cached,"cache_write_tokens":7});
+        raw["usage"]["output_tokens_details"] = json!({"reasoning_tokens":3});
+        raw["usage"]["total_tokens"] = json!(132);
+        let upstream = Mock::new(vec![Reply::ok(raw)]).await;
+        let gw = gateway(config_value(
+            json!({"a":native_backend(&upstream.url,kind,0)}),
+        ));
+        let (s, _, v) = call(&gw, native_request_three()).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["usage"]["input_tokens_details"],
+            json!({"cached_tokens":cached,"cache_write_tokens":7})
+        );
+        assert_eq!(
+            v["usage"]["output_tokens_details"],
+            json!({"reasoning_tokens":3})
+        );
+        assert_eq!(v["usage"]["decora"]["details_complete"], true);
+        if kind == "typesafe" {
+            assert_eq!(v["usage"]["decora"]["input_tokens_basis"], "billable_input");
+        }
+        assert!(DecisionResponse::parse(v, &parse(native_request_three())).is_err()); // 完整细分也不把不同口径误当 strict。
+    }
+}
+
+#[test]
+fn official_native_endpoints_and_usage_policy_are_explicit() {
+    use decora::config::{BackendKind, UsagePolicy};
+    assert_eq!(
+        BackendKind::Typesafe.endpoint(),
+        "https://api.typesafe.ai/v1/systemone"
+    );
+    assert_eq!(
+        BackendKind::Openrouter.endpoint(),
+        "https://openrouter.ai/api/alpha/decisions"
+    );
+    let cfg = config_value(json!({"a":backend("http://127.0.0.1:1234/decisions",0)}));
+    assert!(Config::from_yaml(&cfg.to_string()).unwrap().usage_policy == UsagePolicy::Compatible);
+    let mut bad = cfg;
+    bad["usage_policy"] = json!("guess_zero");
+    assert!(Config::from_yaml(&bad.to_string()).is_err());
 }
 
 #[test]

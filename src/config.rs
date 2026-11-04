@@ -38,6 +38,17 @@ fn types() -> Vec<String> {
     vec!["predicate".into(), "choice".into(), "score".into()]
 }
 
+/// Usage 兼容策略；兼容模式不填充未知明细，严格模式要求完整 OpenAI 口径。
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsagePolicy {
+    /// 默认：保留已知计数并在 native usage.decora 中标明来源和计数口径。
+    #[default]
+    Compatible,
+    /// 只有完整、精确的 OpenAI usage 合同才能进入候选池。
+    Strict,
+}
+
 /// 上游原生协议；不包含聊天 completions 兼容模式。
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +109,8 @@ pub struct Config {
     #[serde(default)]
     pub allow_public_bind: bool,
     pub bearer_key_env: Option<String>,
+    #[serde(default)]
+    pub usage_policy: UsagePolicy,
     #[serde(default)]
     pub allow_http_loopback: bool,
     #[serde(default = "body")]

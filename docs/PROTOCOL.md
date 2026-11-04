@@ -23,7 +23,7 @@ TypeSafe openapi.json
 3ca93b6e6b9aa8d7820531b78c66ed7a9798b11e6e163ad96b140fb3d75fbcf4
 ```
 
-这些在线入口可能更新；将来启用 adapter 或扩展边界时需要重新核对，而不是照旧假定。
+这些在线入口可能更新；扩展 adapter 边界时需要重新核对，而不是照旧假定。已再次核对 OpenRouter 的 operation-level server 为 `https://openrouter.ai`，覆盖全局 `/api/v1` server，因此 Alpha Decisions 的正确入口是 `/api/alpha/decisions`，不重复拼接 `/api/v1`。
 
 ## 2. OpenAI 公开合同
 
@@ -76,7 +76,7 @@ TypeSafe openapi.json
 - score 的概率必须无遗漏、无重复地覆盖原始等级索引与 label，score 等于索引的概率加权期望。
 - 概率和及 score 期望的绝对误差容忍为 **0.0001**，不会重归一化、裁剪或重算上游答案。更大误差返回 `upstream_protocol_error`。
 
-usage 的所有字段都必需
+**OpenAI 原生 usage** 的所有字段都必需；本版 OpenAI adapter 始终按此严格校验，跨上游的默认兼容策略见下一节。
 
 ```json
 {
@@ -90,42 +90,69 @@ usage 的所有字段都必需
 
 这是合同示例，不是真实 API 调用记录。计数必须是非负、在官方 schema 的 int32 上界内的整数；总 token 为输入与输出之和，缓存读写之和不超过输入，推理 token 不超过输出。缓存指南明确读写计数不重叠，并均包含在 input_tokens 中。缺字段或非法数值报错，不把未知缓存、推理 token 视为 0。
 
-## 3. 能力矩阵
+## 3. 默认兼容策略与能力矩阵
 
-“转换可测”与“严格 API 可用”分开列出，避免将 partial adapter 包装为生产支持。
+三个 adapter 都实现了真实 HTTP transport，端到端 mock 检查了各自请求路径、Bearer 凭据、state/questions 映射、核心答案及 usage。接口遵循 OpenAI Decisions 的核心输入/答案结构；**usage 在默认 compatible 模式下是明确的部分兼容合同**，不是声称所有元数据完全同构。
 
-| 能力 | OpenAI 原生 | OpenRouter 原生转换 | TypeSafe/Jev 原生转换 |
+| 能力 | OpenAI 原生 | OpenRouter 原生 | TypeSafe/Jev 原生 |
 |---|---|---|---|
-| 严格 `/v1/decisions` 可调用 | **支持**，需账户权限 | **不可用：unsupported_usage** | **不可用：unsupported_usage** |
+| 默认 compatible 模式 HTTP 调用 | **支持** | **支持纯文本三题型** | **支持纯文本三题型** |
+| strict 模式 HTTP 调用 | 支持完整 OpenAI usage | 提前排除，unsupported_usage | 提前排除，unsupported_usage |
 | 纯文本 predicate | 原样，probability | predicate→noul，noul→probability | 同左 |
 | 纯文本 choice，字符串值 | 原样，包括 descriptions | choices→criteria 对象；概率对象→数组 | 同左 |
 | choice 布尔值 | 支持，保留类型区别 | 明确 unsupported_boolean_choice | 同左 |
 | 纯文本 score | 原样，有序 labels/description | levels→criteria 数组；legend/概率索引→原标签 | 同左 |
 | 重复/省略 name | 支持 | 内部 q0/q1 键，还原原始名字和题序 | 同左 |
-| 角色消息 / JSON parts | 支持对应角色约束 | 本版不映射，unsupported_native_mapping | 同左 |
-| input / question 图片 | 支持；共享总计数限制 | 不映射，不猜测 provider 能力 | 不映射，不启用 danger-zone |
-| refusal | 支持，保留，绝不回退 | 官方答案 union 无 refusal；不虚构映射 | 同左 |
-| 缓存与 safety 参数 | 支持，需候选能力声明 | 不静默丢弃，映射函数报 unsupported | 同左 |
-| 完整 usage | 支持且严格校验 | **缺 cache_write_tokens/reasoning_tokens** | **缺 cache/read/write/reasoning 明细** |
+| 角色消息 / JSON parts | 支持对应角色约束 | 网络调用前过滤，unsupported_native_mapping | 同左 |
+| input / question 图片 | 支持；共享总计数限制 | 提前过滤，可选择其他兼容候选 | 同左，不启用 danger-zone |
+| refusal | 支持，保留，绝不回退 | 官方答案 union 无 refusal；不虚构映射，未知类型报错且不回退 | 同左 |
+| 缓存与 safety 参数 | 支持，需候选能力声明 | 提前过滤，不静默丢弃 | 同左 |
+| usage 明细 | 完整严格校验 | 保留上游提供的明细，未知省略 | 默认只有 input/output，未知明细省略 |
+| usage 口径标记 | 原生 OpenAI 合同，无扩展 | usage.decora 标记 provider_reported | usage.decora 标记 billable_input |
 | 校准质量保证 | 透传原生估计，不作额外保证 | 同左，无聊天 JSON 代替 | 同左 |
 
-### 为什么现在禁用后两者
+### usage_policy: compatible（默认）
 
-OpenRouter 官方 `DecisionsResponse.usage` 只有必需的 input/output token，可选 cost 和 cached_tokens；TypeSafe 官方 `Usage` 只有 input/output token，而且 input_tokens 的语义是 billable input tokens。即使能计算两数之和，也无法据此推断缓存写入和推理 token，更不能保证 billable input 与 OpenAI 总输入的口径完全相同。
+OpenRouter 官方 `DecisionsResponse.usage` 必需 input/output token，可选 cost 和 `input_tokens_details.cached_tokens`；该 details 对象存在时官方要求 cached_tokens。TypeSafe 官方 `Usage` 只有 input/output token，input_tokens 明确是 **billable input tokens**。这些缺失不会阻止核心题型调用：
 
-本版没有引入“猜 0”“假定缓存关闭”“把 JSON 内一个小数解释为概率”或非标准 `usage: null`。运行时能力检查会在任何网络调用之前排除这两类候选；若 alias 只剩这种候选，则返回 `400 unsupported_usage`。若另有兼容 OpenAI 候选则正常选择兼容候选。
+1. input/output 使用上游真实整数，非负且在公开接口的 int32 上界内；total 使用两数之和。上游若额外返回 total，必须与该和一致，不能静默覆盖矛盾统计。
+2. 返回实际提供的 cached_tokens、cache_write_tokens、reasoning_tokens；未知细分字段省略，不填零。只在有已知明细时输出对应 details 对象。所有已知计数都检查非负整数及上界；OpenAI/OpenRouter 的缓存计数按总输入口径检查包含关系。TypeSafe 的 billable input 未承诺包含全部缓存 token，不对其套用 OpenAI 缓存上界，避免跨口径错误比较。
+3. 新增 `usage.decora` 元数据，暴露固定提供方名称而非内部 ID、URL、凭据。含 `provider`、`input_tokens_basis`、`total_tokens_basis`、`details_complete`；存在 cost 时保留为 `provider_cost`。不透传任意上游元数据或错误正文。
+4. OpenAI adapter 本来保证完整 usage，因此始终严格校验自己的官方合同；compatible 不是放宽其非法响应的开关。
 
-### 原生转换实现的范围
+TypeSafe 的兼容响应示例
 
-`adapter::native_body` 和 `adapter::native_answers` 是公开、可测试的协议转换函数，**不是可绕过 usage 限制的网络入口**。
+```json
+{
+  "input_tokens": 120,
+  "output_tokens": 12,
+  "total_tokens": 132,
+  "decora": {
+    "provider": "typesafe",
+    "input_tokens_basis": "billable_input",
+    "total_tokens_basis": "billable_input_plus_output",
+    "details_complete": false
+  }
+}
+```
 
-- 原生请求使用 `state` 与命名 `questions`，不是 OpenAI 的 `input/questions[]`，也不是 chat completions。
+这里的 132 是**计费输入加输出**，不能用于宣称 OpenAI 精确总 token、完整上下文长度或跨上游等口径成本。OpenRouter 对应标记为 `provider: openrouter`、`input_tokens_basis: provider_reported`、`total_tokens_basis: provider_input_plus_output`。`details_complete` 仅说明三个已知细分字段是否都存在，不表示不同上游计数口径相同，也不是校准或计费认证。
+
+### usage_policy: strict（可选）
+
+要求完整 OpenAI usage 与计数口径，不添加兼容扩展。由于官方合同缺少明细或 input 语义不同，运行时在网络调用前排除 OpenRouter/TypeSafe；若 alias 只剩这些候选，返回 `400 unsupported_usage`。若有兼容 OpenAI 候选则继续路由它。默认 compatible 和 strict 使用完全相同的概率、confidence、评分期望、拒答和重试规则。
+
+### 原生 HTTP 转换范围
+
+`adapter::native_body`、`native_answers`、`native_response` 实际用于网关 HTTP 请求/响应链路，不是只有纯函数样例。
+
+- 原生请求使用 `state` 与命名 `questions`，不是 OpenAI 的 `input/questions[]`，也不是 chat completions。只接受字符串 input 和字符串 instructions，避免角色/多模态语义降级。
 - score criteria 无说明时使用 label 字符串，有说明时使用官方允许的 `{label, description}` 结构化指导；返回 legend 必须精确对应该 criteria。
-- OpenRouter 把 choice/score 的 confidence、probabilities 声明为可选，但 OpenAI 必需。缺失时返回协议错误，不合成 confidence 或概率。
-- TypeSafe 图片依赖 assets 和 `TypeSafe-Danger-Zone-Images: true`；OpenRouter 图片还存在 provider 与引用位置差异。本版不尝试跨协议降级这些多模态语义。
-- 不实现 box，因为 OpenAI 目标合同没有这个题型。
+- OpenRouter 把 choice/score 的 confidence、probabilities（score 还包括 legend）声明为可选，但完整核心答案需要这些信息。缺失时返回协议错误，不合成 confidence 或概率；本版也不猜测缺失 legend 的映射。
+- TypeSafe 图片依赖 assets 和 `TypeSafe-Danger-Zone-Images: true`；OpenRouter 图片存在 provider 和引用位置差异。本版不做这些跨协议多模态转换，提前过滤，不会在不支持的上游上付费试错。
+- 不实现 box，因为 OpenAI 目标合同没有这个题型。官方未定义的 native refusal 不映射成 0/false，不盲目换模型。
 
-未来若上游提供完整且有明确语义的 usage，应先更新官方依据与测试，再允许路由；若想要一个保留各上游 usage 原貌的跨厂商 API，那是另一个公开合同，不应伪装成 OpenAI Decisions。
+若依赖完整 OpenAI SDK 的固定 usage 明细，请选择 strict；可处理部分 usage 的客户端应使用默认 compatible，并读取 `usage.decora` 判断统计口径。
 
 ## 4. 错误和路由的最小合同
 

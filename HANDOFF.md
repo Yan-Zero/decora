@@ -1,65 +1,68 @@
 # Decora 开发接续记录
 
-## 任务边界
-独立 Rust OpenAI Decisions 协议网关；目录 E:\source\toy\decora。只在本地实现、离线测试，不部署、不付费调用、不创建远端、不推送、不继续派发 agent。主会话已创建私有 GitHub 仓库，remote/推送由主会话负责。
+## 当前结论（2026-11-04）
+**三个原生 HTTP adapter 均已实现；默认 usage_policy: compatible，OpenRouter/Jev 的纯文本 predicate/choice/score 可调用。26 项测试通过，fmt/check/clippy/audit 全通过。** 不把 usage 细分字段缺失作为默认全局阻塞；未知明细省略，TypeSafe billable input 明确标记。strict 可选，仍在调用前排除无法提供完整 OpenAI usage 的候选。
 
-## 初查（2026-11-04）
-- 目标目录原不存在，已新建；E:\、E:\source、E:\source\toy 没有发现 CLAUDE.md。上级不是 git 仓库。
-- 已有 rustc/cargo 1.95.0，无需安装工具链。
+## 任务边界与环境
+- 独立项目 E:\source\toy\decora，原目录不存在，已新建；E:\、E:\source、E:\source\toy 未发现 CLAUDE.md，上级不是 git 仓库。
+- rustc/cargo 1.95.0 已安装，无需系统安装；没有继续派发 agent。
+- 只本地实现和离线测试，不部署、不付费调用、不创建远端、不推送。主会话已创建私有 GitHub 仓库，remote/推送由主会话负责。
 
-## 官方协议研究（进行中）
-- https://developers.openai.com/api/docs/guides/decisions
-- https://developers.openai.com/api/reference/resources/decisions/methods/create
-  - POST /v1/decisions；model/input/questions，1–400 个题目，predicate/choice/score；概率是原生协议输出，不能用聊天 JSON 冒充。
-  - input 支持字符串/消息数组，instructions 支持文本/内容数组；input_image 不支持 file_id。需要进一步核对图像数量限制。
-  - score levels 为有序 label 列表，不是任意数值刻度；结果包含概率分布、confidence、score；refusal 是独立答案类型。
-- https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-questions-and-answers-request
-  - 原生 POST /api/alpha/decisions，state + 命名 questions；noul/choice/score/box，不能当成 OpenAI 原样透传。
-- https://docs.typesafe.ai/api
-  - 官方提供 https://api.typesafe.ai/openapi.json；POST /v1/systemone，state + 命名 questions，noul/choice/score/box。
-  - 图像依赖 danger-zone header/assets；需核对 schema 后决定安全兼容边界。
-- 搜索出现大量名称相近的第三方域名，均不作为协议依据。
+## 官方研究与协议决策
+官方资料链接和下载 SHA256 详见 docs/PROTOCOL.md；原始全量资料在 gitignore 的 reference/ 内。
 
-## 实施计划
-1. 核对官方完整 schema，明确保真映射/拒绝能力边界并保存文档。
-2. axum/tokio/reqwest 实现：配置校验、凭据环境变量、loopback 默认监听、可配 Bearer 入站鉴权、严格请求与返回校验。
-3. alias→候选池，能力过滤后按 priority/weight 选择，受限重试/回退、Retry-After、连接复用与 redirect 禁用。
-4. 离线 mock 覆盖协议/路由/鉴权/错误/多模态/拒答/概率/usage。
-5. 实跑 fmt/check/test/clippy，安全检查与中文说明，更新本记录。
+- OpenAI 指南和创建接口均已核对，官方 OpenAPI 源为 https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml。
+- OpenRouter 官方 https://openrouter.ai/openapi.json；operation-level server 为 https://openrouter.ai，覆盖全局 /api/v1，因此真实 POST 入口是 https://openrouter.ai/api/alpha/decisions。
+- TypeSafe 官方 https://docs.typesafe.ai/api 和 https://api.typesafe.ai/openapi.json；真实 POST 入口 https://api.typesafe.ai/v1/systemone。
+- native 使用 state + 命名 questions、noul/choice/score，不是 chat completions，也不是直接透传 OpenAI 字段。
+- predicate→noul；choice→字符串键 criteria；score→从零开始的有序 criteria。内部 q0/q1 键保留重复或省略的公开 name；按原题序还原 answers。
+- choice 字符串 "true" 与布尔 true 不混淆：OpenAI 支持二者；native 布尔选项在网络调用前 unsupported_boolean_choice。
+- 图片总限包括 input 与所有 questions.instructions；默认 32 张、8 MiB JSON body，上限 1500 张和 64 MiB。官方通用图片上限为 1500 张、512 MB。本服务不下载图像，模型的格式/动画/patch/context 内容限制由上游检查。
+- input_json 每块限制 32 层容器、10,000 个值、256 KiB 紧凑 JSON。assistant 支持 output_text/refusal 混合内容及 phase:null。
+- 工具调用历史本版 unsupported_tool_history；native 多模态、角色消息、JSON parts、缓存/safety 参数及非字符串 instructions 在网络调用前过滤，可选其他兼容候选。
 
-## 已核实的关键边界
-- 已下载官方 OpenAPI 到 gitignore 的 reference/ 下。OpenAI 源 https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml，OpenRouter https://openrouter.ai/openapi.json，TypeSafe https://api.typesafe.ai/openapi.json。
-- OpenAI 完整 Usage 强制要求 input_tokens_details.cached_tokens/cache_write_tokens 和 output_tokens_details.reasoning_tokens；OpenRouter/TypeSafe 官方 schema 不提供完整明细。严格 API 下这两个 adapter 提前返回 unsupported_usage，不产生明知无法返回完整合同的上游付费请求。原生 request/answers 映射单独实现供离线验证，不能当作生产可用。
-- OpenAI score 以等级位置 0..N-1 计分；ChoiceValue 字符串和布尔类型不混淆；name 可省略、允许重复，响应为 null 或原名称。
-- 图像官方通用上限 1500 张/请求、512 MB，总计 input 与各题 instructions；本服务更保守默认 32 张/8 MiB body，配置上限 64 MiB。网关不下载图像、不解码检查动画/patch，模型的图片内容/分辨率约束由上游检查，4xx 不回退。
-- 官方新增工具调用历史存在，但本版明确 unsupported_tool_history，不冒充完整工具历史支持。
+## Usage 策略（本轮主会话纠正后已完成）
+初版 e14b4b1 将 OpenRouter/Jev 因 usage 缺项全局禁用。主会话明确要求实用的协议转换层，允许显式部分兼容 metadata；本轮已解除默认阻塞，而非只修改文档。
 
-## 最终实现与验证
-- 已完成 src/{config,error,protocol,adapter,gateway,lib,main}.rs、config.example.yaml、tests/offline.rs、中文 README.md 和 docs/PROTOCOL.md。
-- 实现 OpenAI 原生三题型和拒答、角色消息/JSON/共享与题目图片、缓存参数、完整 usage、固定 alias 路由、priority/weight、兼容候选过滤、有界重试/回退、Retry-After 秒数/日期、鉴权、双向 body 限制、并发限制、TLS 校验/redirect 禁用/连接复用及固定脱敏日志。
-- 严格全程 deadline 从鉴权后的入站 body 接收开始计算；已增加慢速上传后收到 429 的回归测试，确认不会因读取 body 耗时而重置上游重试预算。
-- 原生 OpenRouter/TypeSafe 文本 request/answers 转换已测试，但运行时提前返回 unsupported_usage；这是已核实的合同缺口，不是已上线的 adapter。
+- Config 新增 usage_policy，缺省 compatible；strict 可选。
+- compatible：native input/output 使用真实提供的整数，total 为两数之和，未知缓存/推理明细省略，绝不填 0。存在的缓存/推理值照实保留并校验。
+- usage.decora 标记 provider、input_tokens_basis、total_tokens_basis、details_complete；提供方 cost 存在时保留为 provider_cost。只返回固定受控元数据，不透传任意上游字符串。
+- TypeSafe 的 input_tokens_basis=billable_input，total_tokens_basis=billable_input_plus_output。合计不是 OpenAI 精确总输入/输出口径，不能将其用于同口径上下文长度或跨厂商计费推断。若提供额外缓存明细，不用 billable input 当作全部缓存 token 的上界；已测试缓存数大于 billable input 时按真实来源保留而不是错误套用 OpenAI 包含关系。
+- OpenRouter 的口径标记为 provider_reported / provider_input_plus_output。官方可选 cached_tokens 明细存在时保留，缺失写入/推理 token 继续省略。
+- details_complete 只是三个已知细分字段是否存在；即使 native 将来返回所有明细，也不将 billable 口径误当 strict。
+- OpenAI adapter 本来保证完整 usage，因此始终严格校验原生合同；compatible 不会放过其缺项/非法响应。
+- strict：提前排除 native，只剩这类候选则 400 unsupported_usage；存在兼容 OpenAI 候选则继续选择它。
 
-### 最终实际检查（2026-11-04）
-串行命令使用 &&，任一失败都会中止；最终退出码 0。
+## 实现文件
+- src/config.rs：YAML、默认策略、端点/路由校验、环境变量凭据。
+- src/protocol.rs：请求/多模态校验、核心答案、概率/评分期望、部分 usage 与来源元数据。
+- src/adapter.rs：固有能力边界、实际 native request/answers/usage 转换。
+- src/gateway.rs：三类真实 HTTP transport、鉴权、连接池、priority/weight、兼容过滤、重试/回退、Retry-After、全程 deadline、并发/大小限制。
+- src/error.rs、src/main.rs、src/lib.rs：固定脱敏错误、启动入口、公共库。
+- tests/offline.rs：离线端到端与合同边界；config.example.yaml、README.md、docs/PROTOCOL.md 为中文说明及配置/能力矩阵。
+
+## 最终实际检查
+所有命令以 && 串行运行，任一失败即中止；最后退出码 0。
 
 | 检查 | 实际结果 |
 |---|---|
 | cargo fmt --check | 通过，无格式差异 |
-| cargo check --locked | 通过，dev profile 1.14 秒 |
-| cargo test --locked | 1 项路由权重单测 + 18 项离线集成测试，共 19 项全部通过；集成测试 0.83 秒 |
-| cargo clippy --locked --all-targets -- -D warnings | 通过，无警告，1.82 秒 |
-| cargo audit --file Cargo.lock | 182 个锁定依赖，1403 条公告库；无漏洞/维护警告，退出码 0 |
+| cargo check --locked | 通过，0.94 秒 |
+| cargo test --locked | 1 项路由权重单测 + 25 项离线集成测试，共 26 项全部通过；集成测试 0.84 秒 |
+| cargo clippy --locked --all-targets -- -D warnings | 通过，无警告，1.61 秒 |
+| cargo audit --file Cargo.lock | 182 个锁定依赖；1403 条公告库；无漏洞/维护警告，退出码 0 |
 
-首轮测试 13 项通过，Clippy 两项风格警告已修复；按官方 OpenAPI 修正 assistant 混合内容/phase null，补齐 input_json 限制。额外 audit 曾提示 unsafe-libyaml 停止维护（RUSTSEC-2024-0449），已替换为仅启用 deserialize 的 serde-saphyr 2.1 并完成以上全量复验，最终依赖已无该库。
+native 端到端 mock 覆盖两种真实路径、两种三题型请求/答案转换、默认 compatible、strict 预过滤、TypeSafe billable 标记、未知明细省略、已有 0/非零明细原样保留、来源口径不混淆、OpenRouter→TypeSafe 故障回退、429、客户端错误不回退、非法概率/缺 confidence/未知 refusal/非法 usage 不重试。
 
-### Git 与凭据检查
-- 已初始化独立本地 git；为遵守默认分支提交前建分支的约定，交付分支为 feat/decisions-gateway。本机 git 身份 Yan <1964649083@qq.com>；最终提交以 git log -1 --oneline 为准。
+此前共通过初版 19 项测试；首轮 Clippy 两项风格警告已修复。首次 audit 提示 unsafe-libyaml 停止维护（RUSTSEC-2024-0449），已替换为仅启用 deserialize 的 serde-saphyr 2.1，最终依赖无该库或维护警告。
+
+## Git 与凭据
+- 独立本地仓库，交付分支 feat/decisions-gateway；本机身份 Yan <1964649083@qq.com>。初版提交 e14b4b1bb37b6198148ad8af6b6bf25e4a6bc337，本轮兼容策略新提交以 git log -1 --oneline 为准。
 - .gitignore 的 config.yaml、.env、logs/、target/、reference/ 忽略行为已用 git check-ignore 核验。
-- 已扫描常见 OpenAI/GitHub/Google 密钥及私钥模式，无匹配。测试里的 sk-offline-upstream / sk-UPSTREAM-MUST-NOT-LEAK 均为明示的虚构字符串。
-- 没有创建真实 config.yaml，没有读取真实 API key，没有付费调用或部署。未配置 remote、未推送；GitHub 仓库与推送由主会话处理。
+- 常见 OpenAI/GitHub/Google 密钥和私钥模式扫描无发现；测试中的 sk-offline-upstream / sk-UPSTREAM-MUST-NOT-LEAK 为明确的虚构字符串。提交前再次扫描暂存区。
+- 没有真实 config.yaml，没有读取真实 API key，没有付费调用或部署。未配置 remote、未推送。
 
-## 上线前剩余操作
-1. 用户设置真实进程环境变量，复制示例配置并限制文件权限；核对实际账户模型权限。
-2. 在用户授权下发起一个最小真实请求，核对响应合同和账单；本项目的验证全为本机离线 mock。
-3. 公网使用需外部 TLS 反代、防火墙、流量限制与进程守护。OpenRouter/Jev 要等完整 usage 合同补齐并重新审查后才能启用。
+## 上线前操作与限制
+1. 选择实际有权限的模型，安全设置进程环境变量；真实配置文件只允许服务账户读取。README 提供只用 TypeSafe 的完整最小配置，不需要 OpenAI key。
+2. 用户授权后各做最小真实调用，核对账户权限、响应精度/可选字段与账单。本次只有离线 mock，未花费 API 额度，也不证明模型概率在业务数据上已校准。
+3. 公网使用需外部 TLS 反代、防火墙、流量限制与进程守护。本版 native 仅文本子集；需要精确 OpenAI usage 的客户端使用 strict，不把省略值当 0。重试可能重复计费，需要绝对避免时 max_attempts:1。

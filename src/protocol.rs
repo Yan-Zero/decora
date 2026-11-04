@@ -1,5 +1,5 @@
 //! OpenAI Decisions 请求和响应合同；不修补概率、不猜测 token 明细。
-use crate::error::ApiError;
+use crate::{config::UsagePolicy, error::ApiError};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -413,7 +413,7 @@ impl DecisionRequest {
         body
     }
 }
-/// 完整响应，拒答仍然是成功响应的一项。
+/// 核心答案响应；usage 可按显式策略部分兼容，拒答仍然是成功响应的一项。
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionResponse {
@@ -460,28 +460,144 @@ pub struct ScoreProbability {
     pub label: String,
     pub probability: f64,
 }
-/// 必需的完整 token 统计；未知的缓存/推理 token 绝不补零。
+/// Token 统计；兼容模式允许省略未知明细，但从不填零猜测。
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
     pub input_tokens: i32,
-    pub input_tokens_details: InputTokensDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<InputTokensDetails>,
     pub output_tokens: i32,
-    pub output_tokens_details: OutputTokensDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<OutputTokensDetails>,
     pub total_tokens: i32,
+    /// 原生跨协议转换的来源与口径扩展；OpenAI 原生响应不添加此字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decora: Option<UsageMetadata>,
 }
-/// 缓存读取和写入 token 都包含在 input_tokens 中。
+/// 已知的缓存明细；缺失值仍为未知，不等于零。
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputTokensDetails {
-    pub cached_tokens: i32,
-    pub cache_write_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<i32>,
 }
-/// reasoning_tokens 是 output_tokens 的子集。
+/// 已知的推理 token 明细。
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputTokensDetails {
-    pub reasoning_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i32>,
+}
+/// 经过原生协议适配的提供方，而非内部后端 ID 或 URL。
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageProvider {
+    Openrouter,
+    Typesafe,
+}
+/// input_tokens 的真实计数口径，不将计费输入冒充总输入。
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputTokenBasis {
+    ProviderReported,
+    BillableInput,
+}
+/// total_tokens 是哪一种输入口径与输出计数之和。
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TotalTokenBasis {
+    ProviderInputPlusOutput,
+    BillableInputPlusOutput,
+}
+/// 兼容响应扩展：清楚标记来源、输入口径、总量推导及明细完整性。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageMetadata {
+    pub provider: UsageProvider,
+    pub input_tokens_basis: InputTokenBasis,
+    pub total_tokens_basis: TotalTokenBasis,
+    pub details_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_cost: Option<f64>,
+}
+impl Usage {
+    /// 是否具备 OpenAI 所要求的全部明细；不代表不同上游的计数口径相同。
+    pub fn details_complete(&self) -> bool {
+        self.input_tokens_details
+            .as_ref()
+            .is_some_and(|d| d.cached_tokens.is_some() && d.cache_write_tokens.is_some())
+            && self
+                .output_tokens_details
+                .as_ref()
+                .is_some_and(|d| d.reasoning_tokens.is_some())
+    }
+    fn validate(&self, policy: UsagePolicy) -> Result<(), ApiError> {
+        let cached = self
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens);
+        let written = self
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.cache_write_tokens);
+        let reasoning = self
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens);
+        if policy == UsagePolicy::Strict && (!self.details_complete() || self.decora.is_some()) {
+            return Err(ApiError::protocol());
+        }
+        // billable input 未承诺包含全部缓存 token，不能拿它做 OpenAI 口径的缓存上界。
+        let comparable_input = self
+            .decora
+            .as_ref()
+            .is_none_or(|m| m.input_tokens_basis != InputTokenBasis::BillableInput);
+        if [
+            Some(self.input_tokens),
+            Some(self.output_tokens),
+            Some(self.total_tokens),
+            cached,
+            written,
+            reasoning,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|n| n < 0)
+            || i64::from(self.input_tokens) + i64::from(self.output_tokens)
+                != i64::from(self.total_tokens)
+            || (comparable_input
+                && (cached.is_some_and(|n| n > self.input_tokens)
+                    || written.is_some_and(|n| n > self.input_tokens)
+                    || matches!((cached,written),(Some(a),Some(b)) if i64::from(a)+i64::from(b) > i64::from(self.input_tokens))))
+            || reasoning.is_some_and(|n| n > self.output_tokens)
+        {
+            return Err(ApiError::protocol());
+        }
+        if let Some(m) = &self.decora {
+            let consistent = matches!(
+                (&m.provider, &m.input_tokens_basis, &m.total_tokens_basis),
+                (
+                    UsageProvider::Typesafe,
+                    InputTokenBasis::BillableInput,
+                    TotalTokenBasis::BillableInputPlusOutput
+                ) | (
+                    UsageProvider::Openrouter,
+                    InputTokenBasis::ProviderReported,
+                    TotalTokenBasis::ProviderInputPlusOutput
+                )
+            );
+            if !consistent
+                || m.details_complete != self.details_complete()
+                || m.provider_cost.is_some_and(|n| !n.is_finite() || n < 0.0)
+            {
+                return Err(ApiError::protocol());
+            }
+        }
+        Ok(())
+    }
 }
 fn probability(p: f64) -> bool {
     p.is_finite() && (0.0..=1.0).contains(&p)
@@ -490,6 +606,14 @@ const EPS: f64 = 0.0001;
 impl DecisionResponse {
     /// 验证题序、名称、选项覆盖、概率和、评分期望及 usage 守恒。
     pub fn parse(value: Value, req: &DecisionRequest) -> Result<Self, ApiError> {
+        Self::parse_with_usage(value, req, UsagePolicy::Strict)
+    }
+    /// 校验相同的核心答案合同，并按显式策略验证 usage 明细与来源口径。
+    pub fn parse_with_usage(
+        value: Value,
+        req: &DecisionRequest,
+        policy: UsagePolicy,
+    ) -> Result<Self, ApiError> {
         if !value["answers"]
             .as_array()
             .is_some_and(|a| a.iter().all(|a| a.get("name").is_some()))
@@ -579,25 +703,7 @@ impl DecisionResponse {
                 return Err(ApiError::protocol());
             }
         }
-        let u = &response.usage;
-        if [
-            u.input_tokens,
-            u.output_tokens,
-            u.total_tokens,
-            u.input_tokens_details.cached_tokens,
-            u.input_tokens_details.cache_write_tokens,
-            u.output_tokens_details.reasoning_tokens,
-        ]
-        .iter()
-        .any(|n| *n < 0)
-            || i64::from(u.input_tokens) + i64::from(u.output_tokens) != i64::from(u.total_tokens)
-            || i64::from(u.input_tokens_details.cached_tokens)
-                + i64::from(u.input_tokens_details.cache_write_tokens)
-                > i64::from(u.input_tokens)
-            || u.output_tokens_details.reasoning_tokens > u.output_tokens
-        {
-            return Err(ApiError::protocol());
-        }
+        response.usage.validate(policy)?;
         response.model = req.model.clone();
         Ok(response)
     }

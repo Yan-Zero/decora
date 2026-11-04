@@ -1,8 +1,8 @@
-//! 官方原生协议映射。OpenRouter/Jev 的答案映射可测，完整响应因 usage 缺项而禁用。
+//! 官方原生协议映射：默认保留真实可用 usage；严格模式拒绝口径或必需明细差异。
 use crate::{
-    config::{Backend, BackendKind},
+    config::{Backend, BackendKind, UsagePolicy},
     error::ApiError,
-    protocol::{Answer, ChoiceValue, DecisionRequest, Question, Requirements},
+    protocol::{Answer, ChoiceValue, DecisionRequest, DecisionResponse, Question, Requirements},
 };
 use serde_json::{Map, Value, json};
 
@@ -11,6 +11,7 @@ pub fn compatible(
     backend: &Backend,
     req: &DecisionRequest,
     need: &Requirements,
+    usage_policy: UsagePolicy,
 ) -> Result<(), ApiError> {
     let c = &backend.capabilities;
     if req.questions.len() > c.max_questions
@@ -27,15 +28,14 @@ pub fn compatible(
         return Err(ApiError::unsupported("unsupported_capability"));
     }
     if backend.kind != BackendKind::Openai {
-        // 官方两份 schema 都没有 cache_write_tokens / reasoning_tokens；拒绝在付费调用后才发现。
-        return Err(ApiError::unsupported("unsupported_usage"));
+        validate_native_request(req)?;
+        if usage_policy == UsagePolicy::Strict {
+            return Err(ApiError::unsupported("unsupported_usage"));
+        }
     }
     Ok(())
 }
-/// 将保守文本子集映射到 OpenRouter /api/alpha/decisions 或 TypeSafe /v1/systemone。
-/// 此函数供协议验证使用，不代表 adapter 可用于严格 OpenAI API。
-/// 角色消息、多模态说明、布尔选项、缓存和安全标识无法保真时明确报错。
-pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError> {
+fn validate_native_request(req: &DecisionRequest) -> Result<(), ApiError> {
     if !req.input.is_string()
         || req.questions.iter().any(|q| !q.instructions().is_string())
         || req.safety_identifier.is_some()
@@ -44,6 +44,15 @@ pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError
     {
         return Err(ApiError::unsupported("unsupported_native_mapping"));
     }
+    if req.questions.iter().any(|q| matches!(q, Question::Choice {choices,..} if choices.iter().any(|c| matches!(c.value, ChoiceValue::Bool(_))))) {
+        return Err(ApiError::unsupported("unsupported_boolean_choice"));
+    }
+    Ok(())
+}
+/// 将保守文本子集映射到 OpenRouter /api/alpha/decisions 或 TypeSafe /v1/systemone。
+/// 角色消息、多模态说明、布尔选项、缓存和安全标识无法保真时明确报错。
+pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError> {
+    validate_native_request(req)?;
     let mut questions = Map::new();
     for (index, q) in req.questions.iter().enumerate() {
         let mut question = json!({"type": q.kind(), "instructions": q.instructions()});
@@ -147,4 +156,97 @@ pub fn native_answers(value: &Value, req: &DecisionRequest) -> Result<Vec<Answer
         output.push(serde_json::from_value(answer).map_err(|_| ApiError::protocol())?);
     }
     Ok(output)
+}
+
+/// 将官方原生响应转换为核心 OpenAI 答案及透明的 usage 兼容扩展。
+/// input/output 直接来自上游；total 是显式标记口径的两数之和，未知明细不补零。
+pub fn native_response(
+    value: Value,
+    req: &DecisionRequest,
+    kind: BackendKind,
+    policy: UsagePolicy,
+) -> Result<DecisionResponse, ApiError> {
+    if policy == UsagePolicy::Strict {
+        return Err(ApiError::unsupported("unsupported_usage"));
+    }
+    if kind == BackendKind::Openai || value["model"].as_str().is_none_or(str::is_empty) {
+        return Err(ApiError::protocol());
+    }
+    let answers = native_answers(&value, req)?;
+    let source = value["usage"].as_object().ok_or_else(ApiError::protocol)?;
+    let token = |key: &str| {
+        source
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(ApiError::protocol)
+    };
+    let input = token("input_tokens")?;
+    let output = token("output_tokens")?;
+    let total = input.checked_add(output).ok_or_else(ApiError::protocol)?;
+    if source
+        .get("total_tokens")
+        .is_some_and(|n| n.as_i64() != Some(i64::from(total)))
+    {
+        return Err(ApiError::protocol());
+    }
+    let mut usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
+    for (field, known) in [
+        (
+            "input_tokens_details",
+            &["cached_tokens", "cache_write_tokens"][..],
+        ),
+        ("output_tokens_details", &["reasoning_tokens"][..]),
+    ] {
+        if let Some(details) = source.get(field) {
+            let details = details.as_object().ok_or_else(ApiError::protocol)?;
+            if kind == BackendKind::Openrouter
+                && field == "input_tokens_details"
+                && !details.contains_key("cached_tokens")
+            {
+                return Err(ApiError::protocol());
+            }
+            let mut available = Map::new();
+            for key in known {
+                if let Some(value) = details.get(*key) {
+                    let count = value
+                        .as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .ok_or_else(ApiError::protocol)?;
+                    available.insert((*key).into(), json!(count));
+                }
+            }
+            if !available.is_empty() {
+                usage[field] = Value::Object(available);
+            }
+        }
+    }
+    let complete = usage["input_tokens_details"].get("cached_tokens").is_some()
+        && usage["input_tokens_details"]
+            .get("cache_write_tokens")
+            .is_some()
+        && usage["output_tokens_details"]
+            .get("reasoning_tokens")
+            .is_some();
+    usage["decora"] = match kind {
+        BackendKind::Typesafe => {
+            json!({"provider":"typesafe","input_tokens_basis":"billable_input","total_tokens_basis":"billable_input_plus_output","details_complete":complete})
+        }
+        BackendKind::Openrouter => {
+            json!({"provider":"openrouter","input_tokens_basis":"provider_reported","total_tokens_basis":"provider_input_plus_output","details_complete":complete})
+        }
+        BackendKind::Openai => unreachable!("checked above"),
+    };
+    if let Some(cost) = source.get("cost") {
+        let cost = cost
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .ok_or_else(ApiError::protocol)?;
+        usage["decora"]["provider_cost"] = json!(cost);
+    }
+    DecisionResponse::parse_with_usage(
+        json!({"model":value["model"],"answers":answers,"usage":usage}),
+        req,
+        policy,
+    )
 }

@@ -1,7 +1,7 @@
 //! HTTP 服务、连接复用、带能力过滤的加权优先级路由和有界故障回退。
 use crate::{
-    adapter::compatible,
-    config::{Backend, Config, resolve_secret},
+    adapter::{compatible, native_body, native_response},
+    config::{Backend, BackendKind, Config, resolve_secret},
     error::ApiError,
     protocol::{DecisionRequest, DecisionResponse},
 };
@@ -127,11 +127,20 @@ impl Gateway {
             })?;
         let mut compatible_ids = Vec::new();
         let mut usage_blocked = false;
+        let mut incompatible_code = "unsupported_capability";
         for id in ids {
-            match compatible(&self.inner.backends[id].config, &request, &need) {
+            match compatible(
+                &self.inner.backends[id].config,
+                &request,
+                &need,
+                self.inner.config.usage_policy,
+            ) {
                 Ok(()) => compatible_ids.push(id.as_str()),
                 Err(e) => {
                     usage_blocked |= e.code == "unsupported_usage";
+                    if e.code != "unsupported_capability" {
+                        incompatible_code = e.code;
+                    }
                 }
             }
         }
@@ -139,7 +148,7 @@ impl Gateway {
             return Err(ApiError::unsupported(if usage_blocked {
                 "unsupported_usage"
             } else {
-                "unsupported_capability"
+                incompatible_code
             }));
         }
         let order = weighted_order(compatible_ids, &self.inner.backends);
@@ -153,7 +162,12 @@ impl Gateway {
                 return Err(timeout_error());
             };
             let backend = &self.inner.backends[order[attempt % order.len()]];
-            let body = request.openai_body(&backend.config.model);
+            let body = match backend.config.kind {
+                BackendKind::Openai => request.openai_body(&backend.config.model),
+                BackendKind::Openrouter | BackendKind::Typesafe => {
+                    native_body(&request, &backend.config.model)?
+                }
+            };
             let timeout =
                 Duration::from_millis(self.inner.config.attempt_timeout_ms).min(remaining);
             let result = self
@@ -205,7 +219,16 @@ impl Gateway {
                         }
                         let value: Value =
                             serde_json::from_slice(&bytes).map_err(|_| ApiError::protocol())?;
-                        return DecisionResponse::parse(value, &request);
+                        return match backend.config.kind {
+                            // OpenAI 官方本来就保证完整 usage；不把其缺项伪装成兼容模式。
+                            BackendKind::Openai => DecisionResponse::parse(value, &request),
+                            kind => native_response(
+                                value,
+                                &request,
+                                kind,
+                                self.inner.config.usage_policy,
+                            ),
+                        };
                     }
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let seconds = retry_after(

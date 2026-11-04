@@ -1,8 +1,8 @@
 # Decora
 
-**Decora 是一个 Rust 实现的独立 Decisions 协议网关。** 对外提供真正的 `POST /v1/decisions`：接收 `model / input / questions`，返回原生 `predicate / choice / score / refusal`，校验概率分布及完整 token usage。它不调用聊天接口，不生成或伪造“校准概率”。
+**Decora 是一个 Rust 实现的独立 Decisions 协议网关，已实现 OpenAI、OpenRouter 和 TypeSafe/Jev 三种原生 HTTP 链路。** 对外提供 `POST /v1/decisions`：接收 `model / input / questions`，保持 predicate、choice、score 的核心答案结构，透传 OpenAI 的逐题 refusal，并校验真实概率和 token 计数。它不调用聊天接口，不生成或伪造“校准概率”。
 
-当前可运行的是 **OpenAI 原生 Decisions adapter**。OpenRouter 与 TypeSafe/Jev 的官方协议和文本题型转换已经实现并用离线样例验证，但其官方 usage 缺少 OpenAI 强制字段，因此在严格接口下**提前返回 `unsupported_usage`，不发送上游请求**。这两者不是本版可生产使用的后端。详见[协议与能力矩阵](docs/PROTOCOL.md)。
+**默认 `usage_policy: compatible`**：OpenRouter/Jev 的纯文本三题型可用，返回真实已知的 input/output、显式标记口径的合计及存在的明细；未知明细省略，绝不填 0。TypeSafe 的 billable input 通过 `usage.decora` 明确标记，不能当作 OpenAI 精确总输入。需要完整同构 usage 的调用者可设 `usage_policy: strict`，此时提前排除这两个上游。详见[协议与能力矩阵](docs/PROTOCOL.md)。
 
 ## 快速开始
 
@@ -49,9 +49,32 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 评分以等级**位置 `0..N-1`**计分；不是根据 label 的数值计分。响应的 `confidence` 与最大类别概率是两个独立字段。概率是上游模型的估计，Decora 不额外证明其在业务数据上已经校准。
 
+### Usage 策略与透明扩展
+
+- `compatible`（默认）：三类上游都可参与路由。原生 OpenAI 仍严格校验它本来就提供的完整 usage；OpenRouter/Jev 保留已知计数和存在的明细，未知字段省略。
+- `strict`：要求完整精确的 OpenAI usage，OpenRouter/Jev 在发请求前返回 `unsupported_usage` 或被其他兼容候选替代。
+
+例如 TypeSafe 响应可包含如下 usage（合同示例，不是真实调用记录）。这里的 132 **只是计费输入与输出之和**，不是经验证的 OpenAI 总 token 量。
+
+```json
+{
+  "input_tokens": 120,
+  "output_tokens": 12,
+  "total_tokens": 132,
+  "decora": {
+    "provider": "typesafe",
+    "input_tokens_basis": "billable_input",
+    "total_tokens_basis": "billable_input_plus_output",
+    "details_complete": false
+  }
+}
+```
+
+OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若上游提供 `cached_tokens`，则保留该明细而不补 `cache_write_tokens`。上游 cost 存在时保留为 `usage.decora.provider_cost`。依赖精确 OpenAI usage schema 的客户端请启用 strict，而不是将省略值解释为 0。
+
 ### 多模态
 
-文字、图片和 JSON 内容都保留原始结构；不会把角色消息转换成普通文本。
+OpenAI adapter 保留文字、图片和 JSON 的原始结构；不会把角色消息转换成普通文本。OpenRouter/Jev 本版仅接受字符串 input 和字符串 instructions，图片、角色消息、JSON parts、布尔 choice、缓存及 safety 参数在网络调用前被排除，可回退到支持这些能力的 OpenAI 候选。
 
 ```bash
 curl http://127.0.0.1:8787/v1/decisions \
@@ -77,25 +100,34 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 完整字段见 [`config.example.yaml`](config.example.yaml)。`models` 是公开 alias 到后端 ID 列表的映射；每个后端固定绑定 `kind/model/endpoint/api_key_env/capabilities/priority/weight`。
 
+下面是**只使用 TypeSafe/Jev 的完整最小配置**，不需要 OpenAI key。设置 `TYPESAFE_API_KEY` 和 `DECORA_BEARER_KEY`，将前面 curl 的 model 改为 `decora-jev` 即可。模型名称仍需实际账户有权使用。
+
 ```yaml
-# 在示例的 backends 下增加另一个有相同能力的可信 OpenAI 候选
-# secondary:
-#   kind: openai
-#   model: gpt-6-luna
-#   api_key_env: SECONDARY_OPENAI_API_KEY
-#   priority: 10
-#   weight: 1
-#   capabilities: ...  # 显式声明实际支持的能力
+listen: 127.0.0.1:8787
+bearer_key_env: DECORA_BEARER_KEY
+usage_policy: compatible
+backends:
+  jev-official:
+    kind: typesafe
+    model: jev-latest
+    api_key_env: TYPESAFE_API_KEY
+    priority: 0
+    weight: 1
+    capabilities:
+      question_types: [predicate, choice, score]
+      max_questions: 400
 models:
-  decora-luna: [openai-primary] # 增加候选后可写 [openai-primary, secondary]
+  decora-jev: [jev-official]
 ```
+
+OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID（官方示例为 `typesafe/jev-1.13`）和 `api_key_env: OPENROUTER_API_KEY`。默认入口分别为 `https://api.typesafe.ai/v1/systemone`、`https://openrouter.ai/api/alpha/decisions`；无需配置 endpoint。也可把多个后端 ID 放在同一 alias 中实现跨协议回退。
 
 1. 先根据请求实际需要的题型、图片、消息、JSON、缓存、安全标识及题数过滤候选。
 2. `priority` 越小越优先；同一优先级按 `weight` **加权无放回**排列，低优先候选排在后面。
 3. 每个请求最多 `max_attempts` 次**总调用**，包括首次；候选全部尝试完后可从该次排列首位开始下一轮。没有运行时模型发现或后台探测。
 4. 仅连接失败、发送阶段超时、HTTP `429/500/502/503/504` 允许按候选顺序回退或重试；等待带有界指数退避及抖动。
 5. `429 Retry-After` 支持整数秒和 HTTP 日期，在尝试任何下一个候选之前等待。若等待将超过剩余总预算，则立即返回 429 及剩余建议等待秒数，不缩短上游要求的等待。
-6. 客户端错误、上游鉴权错误、拒答、非法概率、usage 缺项、重定向、成功头之后的响应体传输失败都**不回退**。拒答以 HTTP 200 的 `type: refusal` 保留；同批其他答案照常返回。
+6. 客户端错误、上游鉴权错误、拒答、非法概率、必需 usage 计数缺失/非法、重定向、成功头之后的响应体传输失败都**不回退**。OpenAI 拒答以 HTTP 200 的 `type: refusal` 保留；同批其他答案照常返回。OpenRouter/Jev 官方未定义逐题拒答答案；遇到未定义类型返回协议错误，不伪造否定答案、不盲目切换模型。
 
 `attempt_timeout_ms` 覆盖一次上游发送及响应体读取；`request_timeout_ms` 覆盖入站 body 读取、所有尝试和等待。默认分别为 30 秒和 60 秒。响应体也受单独大小限制，并发满时立即返回 503。超时重放可能导致上游重复计费；Decisions 没有在本项目中验证过的幂等凭据合同，需要绝对避免重复调用时将 `max_attempts: 1`。
 
@@ -109,7 +141,7 @@ models:
 - 日志只记录固定消息、尝试次数和固定错误码；不记录输入、问题、响应正文、密钥、上游 URL、alias 或 YAML 内容。启动器固定启用 `decora=info`，不会接受 `RUST_LOG` 开启 HTTP 客户端的敏感 debug 日志。
 - 对外错误统一采用 `{"error":{"message":...,"type":...,"param":null,"code":...}}`，不回显上游错误正文。
 
-常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
+常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_boolean_choice`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
 
 ## 离线验证
 
@@ -120,9 +152,9 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-2026-11-04 实际结果：**19 项测试通过**（1 项单测 + 18 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
+2026-11-04 实际结果：**26 项测试通过**（1 项单测 + 25 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
 
-测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、OpenAI 三题型往返、OpenRouter/TypeSafe 原生转换、概率/usage 校验、角色与图片、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
+测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、三类上游的三题型 HTTP 往返、OpenRouter→TypeSafe 实际协议回退、默认 compatible 与 strict 策略、TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、角色与图片、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
 
 ## 上线前需要完成
 
@@ -132,9 +164,9 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ### 重要边界
 
-- **OpenRouter/Jev 暂不可用**：完整 usage 缺项会导致严格协议失真，因而前置拒绝；官方将来补齐后，需要重新核实 schema 并补测试才能启用。
+- **Usage 是显式部分兼容**：默认模式保留已知数据并标记来源；TypeSafe 的合计是 billable input 加 output，不是 OpenAI 精确总 token。需要完整同构元数据时使用 strict。
 - **能力与实际质量不同**：离线测试证明结构转换和防错行为，不代表真实账户可访问所有模型，也不证明模型概率在你的数据上校准。
-- **严格、保守的协议子集**：工具调用历史明确报 unsupported；未知字段、超限内容或上游非法响应被拒绝而不是静默丢弃。公开返回 `model` 使用请求 alias，避免暴露路由内部名称。
+- **严格、保守的协议子集**：工具调用历史明确报 unsupported；未知请求字段、超限内容或上游非法响应被拒绝而不是静默丢弃。公开返回 `model` 使用请求 alias，避免暴露路由内部名称。
 
 ## 文件
 
@@ -143,7 +175,7 @@ cargo clippy --locked --all-targets -- -D warnings
 - `tests/offline.rs`：离线集成测试；`docs/PROTOCOL.md`：官方依据及能力矩阵。
 - `HANDOFF.md`：开发过程、实际检查结果与接续信息。
 
-## Sources
+## 官方资料来源
 
 - [OpenAI Decisions 指南](https://developers.openai.com/api/docs/guides/decisions)
 - [OpenAI Decisions 创建接口](https://developers.openai.com/api/reference/resources/decisions/methods/create)
