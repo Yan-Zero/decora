@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "结束前提醒完整验证",
+      "trigger": "Stop",
+      "description": "代码改动结束前提醒运行完整验证并同步文档。",
+      "action": {
+        "type": "agent",
+        "prompt": "若本轮修改了 src/、tests/ 或 Cargo.toml：确认已按顺序实际运行 cargo fmt --check、cargo check --locked、cargo test --locked、cargo clippy --locked --all-targets -- -D warnings 并全部通过；若合同/配置有变，确认 README.md、docs/PROTOCOL.md、config.example.yaml、HANDOFF.md 已同步，且 usage 例外的表述一致。未运行的检查要如实说明，不得声称已通过。"
+      }
+    }
+  ]
+}

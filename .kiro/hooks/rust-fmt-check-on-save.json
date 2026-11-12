@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "保存 Rust 文件后检查格式",
+      "trigger": "PostFileSave",
+      "description": "保存 .rs 文件后运行 cargo fmt --check，及早发现格式差异（项目要求 fmt 通过）。",
+      "matcher": "\\.rs$",
+      "action": {
+        "type": "command",
+        "command": "cargo fmt --check",
+        "timeout": 60
+      }
+    }
+  ]
+}
