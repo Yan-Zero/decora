@@ -1,8 +1,8 @@
 # Decora
 
-**Decora 是一个 Rust 实现的独立 Decisions 协议网关。所有公开 model alias 一律使用同一个 `POST /v1/decisions`：固定 OpenAI 形状的 `model / input / questions` 请求与 predicate、choice、score、refusal 核心答案。** 客户端不提交 Jev/OpenRouter 格式、不选择转换策略，也不使用上游的 state/criteria 参数。OpenAI、OpenRouter、TypeSafe/Jev 之间的格式转换由网关自动完成，不调用聊天接口，不伪造概率。
+**Decora 是一个 Rust 实现的独立 Decisions 协议网关。所有公开 model alias 一律使用同一个 `POST /v1/decisions`：固定 OpenAI 形状的 `model / input / questions` 请求与 predicate、choice、score、refusal 核心答案。** 客户端不提交 Jev/OpenRouter 格式、不选择转换策略，也不使用上游的 state/criteria 参数。OpenAI、Gemini、OpenRouter、TypeSafe/Jev 之间的格式转换由网关自动完成，不调用聊天接口，不伪造概率。
 
-文字、角色消息、JSON parts 和布尔/字符串混合 choice 均自动适配；图片等真实能力仍先筛选。**尚存的合同例外是 usage**：默认服务端 `usage_policy: compatible` 保留真实已知统计、允许省略未知明细，并添加 `usage.decora` 标记，**并非严格完全符合 OpenAI usage schema**。TypeSafe billable input 不能冒充精确总输入，未知值也不填 0。管理员可在服务端选择 usage strict；该选项不属于客户端请求。详见[协议与能力矩阵](docs/PROTOCOL.md)。
+文字、角色消息、JSON parts 和布尔/字符串混合 choice 均自动适配；图片等真实能力仍先筛选。**尚存的合同例外是 usage**：默认服务端 `usage_policy: compatible` 保留真实已知统计、允许省略未知明细，并添加 `usage.decora` 标记，**并非严格完全符合 OpenAI usage schema**。TypeSafe billable input 与 Gemini `total_input_tokens` 不能冒充精确总输入，未知值也不填 0。管理员可在服务端选择 usage strict；该选项不属于客户端请求。详见[协议与能力矩阵](docs/PROTOCOL.md)。
 
 ## 快速开始
 
@@ -53,8 +53,8 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 以下是**服务端 config.yaml 管理选项**，不是请求参数。本轮没有把兼容 usage 规范化为严格 OpenAI schema：省略必需明细和增加 `usage.decora` 都是已知差异，不能据此声称整个响应完全一致。
 
-- `compatible`（默认）：三类上游都可参与路由。原生 OpenAI 仍严格校验它本来就提供的完整 usage；OpenRouter/Jev 保留已知计数和存在的明细，未知字段省略。
-- `strict`：要求完整精确的 OpenAI usage，OpenRouter/Jev 在发请求前返回 `unsupported_usage` 或被其他兼容候选替代。
+- `compatible`（默认）：四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）都可参与路由。原生 OpenAI 仍严格校验它本来就提供的完整 usage；Gemini/OpenRouter/Jev 保留已知计数和存在的明细，未知字段省略。
+- `strict`：要求完整精确的 OpenAI usage，Gemini/OpenRouter/Jev 在发请求前返回 `unsupported_usage` 或被其他兼容候选替代。
 
 例如 TypeSafe 响应可包含如下 usage（合同示例，不是真实调用记录）。这里的 132 **只是计费输入与输出之和**，不是经验证的 OpenAI 总 token 量。
 
@@ -72,6 +72,25 @@ curl http://127.0.0.1:8787/v1/decisions \
 }
 ```
 
+Google Gemini 原生响应不提供细分缓存/推理 token（`total_output_tokens` 恒为 0），其 usage 映射为：
+
+```json
+{
+  "input_tokens": 120,
+  "output_tokens": 0,
+  "total_tokens": 120,
+  "decora": {
+    "provider": "gemini",
+    "input_tokens_basis": "total_input_tokens",
+    "total_tokens_basis": "total_input_plus_output",
+    "details_complete": false,
+    "input_tokens_by_modality": [
+      {"modality": "text", "tokens": 120}
+    ]
+  }
+}
+```
+
 OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若上游提供 `cached_tokens`，则保留该明细而不补 `cache_write_tokens`。上游 cost 存在时保留为 `usage.decora.provider_cost`。需要精确 OpenAI usage schema 的部署可由管理员配置 strict；客户端不应将省略值解释为 0。
 
 ### 网关内部的角色、JSON 与有类型选项转换
@@ -79,6 +98,7 @@ OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若�
 **客户端始终发送标准 Decisions 请求；下面仅说明内部实现，不是额外 API、请求选项或调用前置要求。** 对合法且已可映射的角色、JSON 和 typed choice，不会再因为需要内部编码而拒绝。
 
 - OpenAI adapter 保留原始 input/questions 结构。
+- Gemini 使用顶层 `input` 承载共享输入（字符串原样传递；角色消息数组自动文本编码为字符串）；鉴权使用 `x-goog-api-key` 请求头。题目使用内部 ASCII 选项键与紧凑 JSON criteria 字符串无损支持中文/布尔 choice；score criteria 映射为有序非空字符串数组。
 - OpenRouter/Jev 的字符串 input 原样转换；消息数组自动编码为有边界的 JSON 文本，放在官方允许的内部 state 中，保留四种合法角色、顺序、phase、空内容、Unicode 和嵌套 JSON。
 - instructions 字符串原样转换；text/JSON 内容数组自动编码，不要求客户端扁平化数据或选择协议。
 - 不提供输入转换策略或角色/JSON/typed choice 能力开关；图片、题型、题数、缓存与安全标识等真实能力仍独立检查。
@@ -158,7 +178,7 @@ curl http://127.0.0.1:8787/v1/decisions \
   }'
 ```
 
-OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID（官方示例为 `typesafe/jev-1.13`）和 `api_key_env: OPENROUTER_API_KEY`。默认入口分别为 `https://api.typesafe.ai/v1/systemone`、`https://openrouter.ai/api/alpha/decisions`；无需配置 endpoint。也可把多个后端 ID 放在同一 alias 中实现跨协议回退。
+OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID（官方示例为 `typesafe/jev-1.13`）和 `api_key_env: OPENROUTER_API_KEY`。Gemini 配置使用 `kind: gemini`、模型 ID（官方为 `gemini-decision-1`）和 `api_key_env: GEMINI_API_KEY`（鉴权头自动使用 `x-goog-api-key`）。默认入口分别为 `https://api.typesafe.ai/v1/systemone`、`https://openrouter.ai/api/alpha/decisions`、`https://generativelanguage.googleapis.com/v1beta/decisions`；无需配置 endpoint。也可把多个后端 ID 放在同一 alias 中实现跨协议回退。
 
 1. 根据题型、图片、缓存、安全标识、题数及服务端 usage 要求筛选候选；合法角色消息、JSON parts 和 typed choice 自动适配，不因内部转换格式过滤。
 2. `priority` 越小越优先；同一优先级按 `weight` **加权无放回**排列，低优先候选排在后面。
@@ -192,7 +212,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 2026-11-04 实际结果：**34 项测试通过**（1 项单测 + 33 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
 
-测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、三类上游的三题型 HTTP 往返、所有后端 alias 使用相同 OpenAI 请求和核心 answers 的回归、上游专有请求形状拒绝、OpenRouter→TypeSafe 实际协议回退、服务端 usage compatible/strict 选项、TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
+测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）的三题型 HTTP 往返、所有后端 alias 使用相同 OpenAI 请求和核心 answers 的回归、上游专有请求形状拒绝、Gemini/OpenRouter→TypeSafe 实际协议回退、服务端 usage compatible/strict 选项、Gemini total_input_tokens 与 TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权（Bearer 与 x-goog-api-key）、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
 
 ## 上线前需要完成
 
@@ -202,7 +222,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ### 重要边界
 
-- **Usage 是显式部分兼容**：默认模式保留已知数据并标记来源；TypeSafe 的合计是 billable input 加 output，不是 OpenAI 精确总 token。需要完整同构元数据时使用 strict。
+- **Usage 是显式部分兼容**：默认模式保留已知数据并标记来源；TypeSafe 的合计是 billable input 加 output，Gemini 的合计是 total_input_tokens 加 output，不是 OpenAI 精确总 token。需要完整同构元数据时使用 strict。
 - **能力与实际质量不同**：离线测试证明结构转换和防错行为，不代表真实账户可访问所有模型，也不证明模型概率在你的数据上校准。
 - **严格、保守的协议子集**：工具调用历史明确报 unsupported；未知请求字段、超限内容或上游非法响应被拒绝而不是静默丢弃。公开返回 `model` 使用请求 alias，避免暴露路由内部名称。
 
@@ -217,5 +237,6 @@ cargo clippy --locked --all-targets -- -D warnings
 
 - [OpenAI Decisions 指南](https://developers.openai.com/api/docs/guides/decisions)
 - [OpenAI Decisions 创建接口](https://developers.openai.com/api/reference/resources/decisions/methods/create)
+- [Google Gemini Decisions API](https://aistudio.google.com/docs/decisions-api)
 - [OpenRouter Alpha Decisions](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-questions-and-answers-request)
 - [TypeSafe 官方 API](https://docs.typesafe.ai/api)

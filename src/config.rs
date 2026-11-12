@@ -56,6 +56,7 @@ pub enum BackendKind {
     Openai,
     Openrouter,
     Typesafe,
+    Gemini,
 }
 impl BackendKind {
     /// 官方固定入口；配置可由管理员替换为可信入口。
@@ -64,6 +65,7 @@ impl BackendKind {
             Self::Openai => "https://api.openai.com/v1/decisions",
             Self::Openrouter => "https://openrouter.ai/api/alpha/decisions",
             Self::Typesafe => "https://api.typesafe.ai/v1/systemone",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/decisions",
         }
     }
 }

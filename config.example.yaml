@@ -37,10 +37,20 @@ models:
 # 可在 backends/models 中添加以下原生上游；默认支持文本、角色消息、JSON 和混合 typed choice。
 # 角色/JSON/typed choice 自动内部适配，没有格式开关；images 等真实能力仍需声明。
 # 角色文本编码保留标签/顺序，不等于原生 OpenAI 指令层级，也不是 prompt injection 隔离。
-# 未知缓存/推理 token 不填 0；TypeSafe billable input 明确写入 usage.decora。
+# 未知缓存/推理 token 不填 0；TypeSafe billable input 与 Gemini total_input_tokens 明确写入 usage.decora。
 # strict 模式会提前返回 unsupported_usage；不会为获取缺失明细而付费调用。
 # 只配置实际使用的后端；启动时会要求所有已配置后端的凭据环境变量。
 # backends 中可添加
+#   gemini-official:
+#     kind: gemini
+#     model: gemini-decision-1  # 官方原生 Decisions 模型
+#     api_key_env: GEMINI_API_KEY
+#     priority: 10
+#     weight: 1
+#     capabilities:
+#       question_types: [predicate, choice, score]
+#       images: false
+#       max_questions: 400
 #   jev-official:
 #     kind: typesafe
 #     model: jev-latest  # 账户可用名以 TypeSafe GET /v1/models 为准
@@ -62,6 +72,7 @@ models:
 #       images: false
 #       max_questions: 400
 # models 中可添加
+#   decora-gemini: [gemini-official]
 #   decora-jev: [jev-official]
 #   decora-router: [router-jev]
-#   decora-text-auto: [router-jev, jev-official, openai-primary]
+#   decora-text-auto: [gemini-official, router-jev, jev-official, openai-primary]

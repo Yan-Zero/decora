@@ -26,18 +26,19 @@ fileMatchPattern: "{src/adapter.rs,src/protocol.rs,src/gateway.rs,tests/offline.
 
 ## 内部映射不变量
 
-- OpenRouter/Jev：predicate→`noul`，choice→criteria 对象，score→criteria 数组；重复/省略 name 用内部 `q0/q1…` 键并还原。
-- 含布尔的 choice 组：整组改用 `decora_choice_0…N-1` 内部键，criteria 保留原始 JSON 类型的 value/description；还原时不得碰撞（等于内部键的字符串、空字符串、`false`）。纯字符串组保持原字符串键。
+- 非 OpenAI 原生后端（Gemini、OpenRouter、Jev）：predicate→`noul`；重复/省略 name 用内部 `q0/q1…` 键并还原。
+- OpenRouter/Jev：choice→criteria 对象，score→criteria 数组。含布尔的 choice 组改用 `decora_choice_0…N-1` 内部键，criteria 保留原始 JSON 类型的 value/description；还原时不得碰撞。纯字符串组保持原字符串键。
+- Gemini：顶层使用 `input`（非 `state`），鉴权使用 `x-goog-api-key`。choice 统一使用内部 `decora_choice_0…N-1` 键与紧凑 JSON criteria 字符串；score criteria 为有序非空字符串数组。响应顶层可无 `model`。
 - 消息/JSON/text 数组被序列化为一个字符串：`{"decora_encoding":"openai_decisions_text_v1","kind":"messages"|"question_content","data":...}`。保留 JSON 语义，不承诺空白和键顺序。
 - 角色标签 ≠ 原生指令层级；JSON 边界 ≠ prompt injection 隔离。文档中不得暗示相反。
 - JSON 数据里的 `role/type/image_url` 键只是普通数据。
-- 真实 `input_image` 在编码前独立排除 OpenRouter/Jev，`capabilities.images: true` 不能扩大 adapter 固有能力。
+- 真实 `input_image` 在编码前独立排除 Gemini/OpenRouter/Jev，`capabilities.images: true` 不能扩大 adapter 固有能力。
 
 ## usage
 
 - OpenAI 原生：所有字段必需、严格校验（缓存读写不重叠且都含于 input；推理 ≤ output；total = input+output；int32 上界）。
-- compatible：保留真实已知值，未知省略不填 0；`usage.decora` 标记 `provider / input_tokens_basis / total_tokens_basis / details_complete`，有 cost 时为 `provider_cost`。TypeSafe 为 `billable_input`，不套用 OpenAI 缓存包含关系。
-- strict：请求前排除 OpenRouter/Jev，只剩它们则 `400 unsupported_usage`。
+- compatible：保留真实已知值，未知省略不填 0；`usage.decora` 标记 `provider / input_tokens_basis / total_tokens_basis / details_complete`，有 cost 时为 `provider_cost`。TypeSafe 为 `billable_input`，不套用 OpenAI 缓存包含关系；Gemini 为 `total_input_tokens`，可选保留合法的 `input_tokens_by_modality`。
+- strict：请求前排除 Gemini/OpenRouter/Jev，只剩它们则 `400 unsupported_usage`。
 - 概率、confidence、重试规则在两种模式下完全相同。
 
 ## 重试与回退

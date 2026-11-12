@@ -1,6 +1,6 @@
 //! HTTP 服务、连接复用、带能力过滤的加权优先级路由和有界故障回退。
 use crate::{
-    adapter::{compatible, native_body, native_response},
+    adapter::{compatible, native_body_for, native_response},
     config::{Backend, BackendKind, Config, resolve_secret},
     error::ApiError,
     protocol::{DecisionRequest, DecisionResponse},
@@ -164,27 +164,23 @@ impl Gateway {
             let backend = &self.inner.backends[order[attempt % order.len()]];
             let body = match backend.config.kind {
                 BackendKind::Openai => request.openai_body(&backend.config.model),
-                BackendKind::Openrouter | BackendKind::Typesafe => {
-                    native_body(&request, &backend.config.model)?
-                }
+                kind => native_body_for(&request, &backend.config.model, kind)?,
             };
             let timeout =
                 Duration::from_millis(self.inner.config.attempt_timeout_ms).min(remaining);
-            let result = self
-                .inner
-                .client
-                .post(
-                    backend
-                        .config
-                        .endpoint
-                        .as_deref()
-                        .unwrap_or(backend.config.kind.endpoint()),
-                )
-                .bearer_auth(&backend.key)
-                .json(&body)
-                .timeout(timeout)
-                .send()
-                .await;
+            let mut req_builder = self.inner.client.post(
+                backend
+                    .config
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or(backend.config.kind.endpoint()),
+            );
+            if backend.config.kind == BackendKind::Gemini {
+                req_builder = req_builder.header("x-goog-api-key", &backend.key);
+            } else {
+                req_builder = req_builder.bearer_auth(&backend.key);
+            }
+            let result = req_builder.json(&body).timeout(timeout).send().await;
             let wait;
             match result {
                 Ok(mut response) => {

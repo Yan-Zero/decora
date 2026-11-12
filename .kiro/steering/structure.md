@@ -12,10 +12,10 @@ src/
   lib.rs                # 模块声明，导出 Config / Gateway
   config.rs             # 配置与凭据解析、校验
   protocol.rs           # 对外 OpenAI Decisions 请求/响应合同与校验
-  adapter.rs            # 能力边界与 OpenAI/OpenRouter/TypeSafe 原生协议映射
+  adapter.rs            # 能力边界与 OpenAI/Gemini/OpenRouter/TypeSafe 原生协议映射
   gateway.rs            # HTTP 路由、鉴权、候选排序、重试/回退、超时
   error.rs              # 统一对外错误体与错误码
-tests/offline.rs        # 离线集成测试（loopback mock 上游，约 33 项）
+tests/offline.rs        # 离线集成测试（loopback mock 上游，约 37 项）
 ```
 
 ## 职责划分

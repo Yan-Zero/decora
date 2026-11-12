@@ -9,10 +9,11 @@
 | 提供方 | 文档 | 机器可读 schema | 原生 POST 入口 |
 |---|---|---|---|
 | OpenAI | [指南](https://developers.openai.com/api/docs/guides/decisions)、[创建接口](https://developers.openai.com/api/reference/resources/decisions/methods/create) | [官方 openai-openapi](https://raw.githubusercontent.com/openai/openai-openapi/master/openapi.yaml) | `https://api.openai.com/v1/decisions` |
+| Google Gemini | [Decisions API](https://aistudio.google.com/docs/decisions-api) | [AI Studio 官方规范](https://aistudio.google.com/docs/decisions-api) | `https://generativelanguage.googleapis.com/v1beta/decisions` |
 | OpenRouter | [Alpha Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-questions-and-answers-request) | [官方 OpenAPI](https://openrouter.ai/openapi.json) | `https://openrouter.ai/api/alpha/decisions` |
 | TypeSafe / Jev | [官方 API](https://docs.typesafe.ai/api) | [官方 OpenAPI](https://api.typesafe.ai/openapi.json) | `https://api.typesafe.ai/v1/systemone` |
 
-其他依据：[OpenAI 图片规则](https://developers.openai.com/api/docs/guides/images-vision)、[缓存定义](https://developers.openai.com/api/docs/guides/prompt-caching)。所有入口采用服务端配置的 Bearer key；不转发调用者凭据。
+其他依据：[OpenAI 图片规则](https://developers.openai.com/api/docs/guides/images-vision)、[缓存定义](https://developers.openai.com/api/docs/guides/prompt-caching)。Gemini 入口采用服务端配置的 `x-goog-api-key`；其余入口采用服务端配置的 Bearer key；不转发调用者凭据。
 
 下载的原始资料在本机 `reference/` 下（不进 git，避免把巨大的官方全量 schema 纳入小项目）。本次 SHA256 为
 
@@ -94,25 +95,25 @@ TypeSafe openapi.json
 
 ## 3. 默认兼容策略与能力矩阵
 
-三个 adapter 都实现了真实 HTTP transport，端到端 mock 检查了各自请求路径、Bearer 凭据、state/questions 映射、核心答案及 usage。接口遵循 OpenAI Decisions 的核心输入/答案结构；**usage 在默认 compatible 模式下是明确的部分兼容合同**，不是声称所有元数据完全同构。
+四个 adapter 都实现了真实 HTTP transport，端到端 mock 检查了各自请求路径、鉴权头（Bearer 或 x-goog-api-key）、input/state 与 questions 映射、核心答案及 usage。接口遵循 OpenAI Decisions 的核心输入/答案结构；**usage 在默认 compatible 模式下是明确的部分兼容合同**，不是声称所有元数据完全同构。
 
-| 能力 | OpenAI 原生 | OpenRouter 原生 | TypeSafe/Jev 原生 |
-|---|---|---|---|
-| 默认模式 HTTP 调用 | **支持原生结构** | **支持文本/角色/JSON/typed choice 三题型转换** | 同左 |
-| usage_policy: strict | 支持完整 OpenAI usage | 提前排除，unsupported_usage | 提前排除，unsupported_usage |
-| 纯文本 predicate | 原样，probability | predicate→noul，noul→probability | 同左 |
-| 纯文本 choice，字符串值 | 原样，包括 descriptions | choices→criteria 对象；概率对象→数组 | 同左 |
-| 布尔/字符串混合 choice | 支持原生类型区别 | 全组内部索引键，保留原值/描述，答案准确还原类型 | 同左 |
-| 纯文本 score | 原样，有序 labels/description | levels→criteria 数组；legend/概率索引→原标签 | 同左 |
-| 重复/省略 name | 支持 | 内部 q0/q1 键，还原原始名字和题序 | 同左 |
-| 角色消息 / JSON parts | 原结构及原生角色约束 | 自动内部编码保留角色/顺序/JSON，无客户端格式或转换开关 | 同左 |
-| 原生角色指令层级 | 由 OpenAI 执行 | 文本标签不提供原生层级保证 | 同左 |
-| input / question 图片 | 支持；共享总计数限制 | 提前过滤，可选择其他兼容候选 | 同左，不启用 danger-zone |
-| refusal | 支持，保留，绝不回退 | 官方答案 union 无 refusal；不虚构映射，未知类型报错且不回退 | 同左 |
-| 缓存与 safety 参数 | 支持，需候选能力声明 | 提前过滤，不静默丢弃 | 同左 |
-| usage 明细 | 完整严格校验 | 保留上游提供的明细，未知省略 | 默认只有 input/output，未知明细省略 |
-| usage 口径标记 | 原生 OpenAI 合同，无扩展 | usage.decora 标记 provider_reported | usage.decora 标记 billable_input |
-| 校准质量保证 | 透传原生估计，不作额外保证 | 同左，无聊天 JSON 代替 | 同左 |
+| 能力 | OpenAI 原生 | Google Gemini 原生 | OpenRouter 原生 | TypeSafe/Jev 原生 |
+|---|---|---|---|---|
+| 默认模式 HTTP 调用 | **支持原生结构** | **支持文本/角色/JSON/typed choice 三题型转换**（顶层 input，x-goog-api-key） | **支持文本/角色/JSON/typed choice 三题型转换**（顶层 state，Bearer） | 同左 |
+| usage_policy: strict | 支持完整 OpenAI usage | 提前排除，unsupported_usage | 提前排除，unsupported_usage | 提前排除，unsupported_usage |
+| 纯文本 predicate | 原样，probability | predicate→noul，noul→probability | 同左 | 同左 |
+| 纯文本 choice，字符串值 | 原样，包括 descriptions | choices 统一映射为 decora_choice_0..N-1 与紧凑 JSON criteria 字符串 | choices→criteria 对象；概率对象→数组 | 同左 |
+| 布尔/字符串混合 choice | 支持原生类型区别 | 统一内部 decora_choice_0..N-1 键与紧凑 JSON 字符串，100% 精确还原类型 | 全组内部索引键，保留原值/描述，答案准确还原类型 | 同左 |
+| 纯文本 score | 原样，有序 labels/description | levels 转换为有序非空字符串数组 criteria；还原原标签与加权评分 | levels→criteria 数组；legend/概率索引→原标签 | 同左 |
+| 重复/省略 name | 支持 | 内部 q0/q1 键，还原原始名字和题序 | 同左 | 同左 |
+| 角色消息 / JSON parts | 原结构及原生角色约束 | 自动内部编码保留角色/顺序/JSON 为顶层 input 字符串 | 自动内部编码保留角色/顺序/JSON 为顶层 state 字符串 | 同左 |
+| 原生角色指令层级 | 由 OpenAI 执行 | 文本标签不提供原生层级保证 | 文本标签不提供原生层级保证 | 同左 |
+| input / question 图片 | 支持；共享总计数限制 | 提前过滤，可选择其他兼容候选 | 同左 | 同左，不启用 danger-zone |
+| refusal | 支持，保留，绝不回退 | 官方响应无逐题 refusal；整批安全拦截 400 映射为 upstream_client_error | 官方答案 union 无 refusal；不虚构映射，未知类型报错且不回退 | 同左 |
+| 缓存与 safety 参数 | 支持，需候选能力声明 | 官方不支持，提前过滤 | 提前过滤，不静默丢弃 | 同左 |
+| usage 明细 | 完整严格校验 | 必需 total_input/total_output(0)/total_tokens，未知明细省略 | 保留上游提供的明细，未知省略 | 默认只有 input/output，未知明细省略 |
+| usage 口径标记 | 原生 OpenAI 合同，无扩展 | usage.decora 标记 total_input_tokens，可选 modality | usage.decora 标记 provider_reported | usage.decora 标记 billable_input |
+| 校准质量保证 | 透传原生估计，不作额外保证 | 同左，无聊天 JSON 代替 | 同左，无聊天 JSON 代替 | 同左 |
 
 ### 服务端管理选项 usage_policy: compatible（默认）
 
@@ -139,20 +140,22 @@ TypeSafe 的兼容响应示例
 }
 ```
 
-这里的 132 是**计费输入加输出**，不能用于宣称 OpenAI 精确总 token、完整上下文长度或跨上游等口径成本。OpenRouter 对应标记为 `provider: openrouter`、`input_tokens_basis: provider_reported`、`total_tokens_basis: provider_input_plus_output`。`details_complete` 仅说明三个已知细分字段是否都存在，不表示不同上游计数口径相同，也不是校准或计费认证。
+这里的 132 是**计费输入加输出**，不能用于宣称 OpenAI 精确总 token、完整上下文长度或跨上游等口径成本。OpenRouter 对应标记为 `provider: openrouter`、`input_tokens_basis: provider_reported`、`total_tokens_basis: provider_input_plus_output`。Google Gemini 对应标记为 `provider: gemini`、`input_tokens_basis: total_input_tokens`、`total_tokens_basis: total_input_plus_output`，若上游返回合法的 `input_tokens_by_modality` 则原样保留在 `usage.decora` 中。`details_complete` 仅说明三个已知细分字段是否都存在，不表示不同上游计数口径相同，也不是校准或计费认证。
 
 ### 服务端管理选项 usage_policy: strict（可选）
 
-要求完整 OpenAI usage 与计数口径，不添加兼容扩展。由于官方合同缺少明细或 input 语义不同，运行时在网络调用前排除 OpenRouter/TypeSafe；若 alias 只剩这些候选，返回 `400 unsupported_usage`。若有兼容 OpenAI 候选则继续路由它。默认 compatible 和 strict 使用完全相同的概率、confidence、评分期望、拒答和重试规则。
+要求完整 OpenAI usage 与计数口径，不添加兼容扩展。由于官方合同缺少明细或 input 语义不同，运行时在网络调用前排除 Gemini/OpenRouter/TypeSafe；若 alias 只剩这些候选，返回 `400 unsupported_usage`。若有兼容 OpenAI 候选则继续路由它。默认 compatible 和 strict 使用完全相同的概率、confidence、评分期望、拒答和重试规则。
 
 ### 原生 HTTP 转换范围
 
-`adapter::native_body`、`native_answers`、`native_response` 实际用于网关 HTTP 请求/响应链路，不是只有纯函数样例。
+`adapter::native_body_for`、`native_answers_for`、`native_response` 实际用于网关 HTTP 请求/响应链路，不是只有纯函数样例。
 
-- 原生请求使用 `state` 与命名 `questions`，不是 OpenAI 的 `input/questions[]`，也不是 chat completions。字符串 input/instructions 原样使用；默认还支持经过显式文本编码的角色消息和 text/JSON 内容数组，详见下节。
-- score criteria 无说明时使用 label 字符串，有说明时使用官方允许的 `{label, description}` 结构化指导；返回 legend 必须精确对应该 criteria。
+- 原生请求使用 `input`（Gemini）或 `state`（OpenRouter/TypeSafe）与命名 `questions`，不是 OpenAI 的 `input/questions[]`，也不是 chat completions。字符串 input/instructions 原样使用；默认还支持经过显式文本编码的角色消息和 text/JSON 内容数组。
+- score criteria：OpenRouter/TypeSafe 无说明时使用 label 字符串，有说明时使用官方允许的 `{label, description}` 结构化指导；Gemini 要求非空字符串数组，空 label 或带 description 时转换为紧凑 JSON 字符串。返回 legend 必须精确对应该 criteria。
+- choice criteria：Gemini 限制选项键为 1..=128 位纯 ASCII 且描述必须为字符串，统一采用 `decora_choice_0..N-1` 与紧凑 JSON 字符串无损支持中文、空串、布尔 `true`/`false` 及同名内部键。
+- 顶层 `model`：Gemini 官方响应不含顶层 `model` 字段（若存在则要求为非空字符串），对外响应由网关统一填充客户端请求的公开 alias。
 - OpenRouter 把 choice/score 的 confidence、probabilities（score 还包括 legend）声明为可选，但完整核心答案需要这些信息。缺失时返回协议错误，不合成 confidence 或概率；本版也不猜测缺失 legend 的映射。
-- TypeSafe 图片依赖 assets 和 `TypeSafe-Danger-Zone-Images: true`；OpenRouter 图片存在 provider 和引用位置差异。本版不做这些跨协议多模态转换，提前过滤，不会在不支持的上游上付费试错。
+- 图片处理：Gemini instructions 仅支持纯文本，其共享 input 图片强制要求 mime_type，且安全策略禁止网关拉取远端图片或推断类型；TypeSafe 图片依赖 assets 和 danger-zone；OpenRouter 存在 provider 差异。本版对非 OpenAI 后端统一在网络调用前排除真实 `input_image`。
 - 不实现 box，因为 OpenAI 目标合同没有这个题型。官方未定义的 native refusal 不映射成 0/false，不盲目换模型。
 
 需要严格完整 usage 的部署可由管理员配置 usage strict；客户端仍使用同一请求格式，不选择上游协议。compatible 下必须认识到省略必需明细及 `usage.decora` 是当前外部 schema 偏差，不能将未知值补 0 或宣称整个响应完全符合 OpenAI。

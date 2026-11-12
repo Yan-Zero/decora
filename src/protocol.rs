@@ -497,6 +497,7 @@ pub struct OutputTokensDetails {
 pub enum UsageProvider {
     Openrouter,
     Typesafe,
+    Gemini,
 }
 /// input_tokens 的真实计数口径，不将计费输入冒充总输入。
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -504,6 +505,7 @@ pub enum UsageProvider {
 pub enum InputTokenBasis {
     ProviderReported,
     BillableInput,
+    TotalInputTokens,
 }
 /// total_tokens 是哪一种输入口径与输出计数之和。
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -511,6 +513,7 @@ pub enum InputTokenBasis {
 pub enum TotalTokenBasis {
     ProviderInputPlusOutput,
     BillableInputPlusOutput,
+    TotalInputPlusOutput,
 }
 /// 兼容响应扩展：清楚标记来源、输入口径、总量推导及明细完整性。
 #[derive(Serialize, Deserialize)]
@@ -522,6 +525,8 @@ pub struct UsageMetadata {
     pub details_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_by_modality: Option<Vec<Value>>,
 }
 impl Usage {
     /// 是否具备 OpenAI 所要求的全部明细；不代表不同上游的计数口径相同。
@@ -587,9 +592,28 @@ impl Usage {
                     UsageProvider::Openrouter,
                     InputTokenBasis::ProviderReported,
                     TotalTokenBasis::ProviderInputPlusOutput
+                ) | (
+                    UsageProvider::Gemini,
+                    InputTokenBasis::TotalInputTokens,
+                    TotalTokenBasis::TotalInputPlusOutput
                 )
             );
+            let modality_valid = m.input_tokens_by_modality.as_ref().is_none_or(|items| {
+                items.iter().all(|item| {
+                    item.as_object().is_some_and(|obj| {
+                        obj.get("modality")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                            && obj
+                                .get("tokens")
+                                .and_then(Value::as_i64)
+                                .and_then(|n| i32::try_from(n).ok())
+                                .is_some_and(|n| n >= 0)
+                    })
+                })
+            });
             if !consistent
+                || !modality_valid
                 || m.details_complete != self.details_complete()
                 || m.provider_cost.is_some_and(|n| !n.is_finite() || n < 0.0)
             {

@@ -436,7 +436,7 @@ async fn image_limits_body_limits_unknown_models_and_unsupported_do_not_call_ups
         .0,
         StatusCode::BAD_REQUEST
     );
-    for kind in ["typesafe", "openrouter"] {
+    for kind in ["typesafe", "openrouter", "gemini"] {
         let mut b = backend(&source.url, 0);
         b["kind"] = json!(kind);
         let mut cfg = config_value(json!({"native":b}));
@@ -815,6 +815,8 @@ fn native_backend(url: &str, kind: &str, priority: u32) -> Value {
     b["kind"] = json!(kind);
     b["model"] = json!(if kind == "typesafe" {
         "jev-latest"
+    } else if kind == "gemini" {
+        "gemini-decision-1"
     } else {
         "typesafe/jev-1.13"
     });
@@ -912,7 +914,7 @@ async fn native_to_native_fallback_uses_each_backends_real_protocol() {
 
 #[tokio::test]
 async fn strict_usage_policy_and_native_multimodal_boundaries_filter_before_network() {
-    for kind in ["typesafe", "openrouter"] {
+    for kind in ["typesafe", "openrouter", "gemini"] {
         let native = Mock::new(vec![]).await;
         let openai = Mock::new(vec![Reply::ok(success()), Reply::ok(success())]).await;
         let base = config_value(
@@ -1279,9 +1281,34 @@ async fn identical_openai_request_and_answers_contract_for_every_backend_alias()
         ("openai", "/v1/decisions"),
         ("openrouter", "/api/alpha/decisions"),
         ("typesafe", "/v1/systemone"),
+        ("gemini", "/v1beta/decisions"),
     ] {
         let response = if kind == "openai" {
             json!({"model":"resolved","answers":answers,"usage":usage()})
+        } else if kind == "gemini" {
+            let probabilities: serde_json::Map<String, Value> = (0..6)
+                .map(|i| {
+                    (
+                        format!("decora_choice_{i}"),
+                        json!(if i == 2 { 0.75 } else { 0.05 }),
+                    )
+                })
+                .collect();
+            json!({
+                "answers": {
+                    "q0": {
+                        "type": "choice",
+                        "choice": "decora_choice_2",
+                        "confidence": 0.6,
+                        "probabilities": probabilities,
+                    }
+                },
+                "usage": {
+                    "total_input_tokens": 10,
+                    "total_output_tokens": 0,
+                    "total_tokens": 10,
+                }
+            })
         } else {
             typed_native_response(2)
         };
@@ -1302,9 +1329,43 @@ async fn identical_openai_request_and_answers_contract_for_every_backend_alias()
         // 本轮只统一请求与核心 answers；兼容 usage 扩展仍是明确保留的合同差异。
         if kind == "openai" {
             assert!(v["usage"].get("decora").is_none());
+        } else if kind == "gemini" {
+            assert_eq!(v["usage"]["decora"]["provider"], "gemini");
+            assert_eq!(
+                v["usage"]["decora"]["input_tokens_basis"],
+                "total_input_tokens"
+            );
+            assert_eq!(
+                v["usage"]["decora"]["total_tokens_basis"],
+                "total_input_plus_output"
+            );
+            assert_eq!(v["usage"]["decora"]["details_complete"], false);
+            assert_eq!(v["usage"]["input_tokens"], 10);
+            assert_eq!(v["usage"]["output_tokens"], 0);
+            assert_eq!(v["usage"]["total_tokens"], 10);
+            assert!(v["usage"].get("input_tokens_details").is_none());
+            assert!(v["usage"].get("output_tokens_details").is_none());
         } else {
             assert_eq!(v["usage"]["decora"]["provider"], kind);
             assert!(v["usage"].get("input_tokens_details").is_none());
+        }
+        {
+            let seen = upstream.state.seen.lock().unwrap();
+            if kind == "gemini" {
+                assert_eq!(seen[0].0["x-goog-api-key"], "sk-offline-upstream");
+                assert!(seen[0].0.get("authorization").is_none());
+                assert!(seen[0].1.get("input").is_some());
+                assert!(seen[0].1.get("state").is_none());
+            } else {
+                assert_eq!(seen[0].0["authorization"], "Bearer sk-offline-upstream");
+                assert!(seen[0].0.get("x-goog-api-key").is_none());
+                if kind == "openai" {
+                    assert!(seen[0].1.get("input").is_some());
+                } else {
+                    assert!(seen[0].1.get("state").is_some());
+                    assert!(seen[0].1.get("input").is_none());
+                }
+            }
         }
         // 上游专有请求形状不成为额外公开 API；转换设置也不能由客户端传入。
         for invalid in [
@@ -1325,7 +1386,7 @@ async fn identical_openai_request_and_answers_contract_for_every_backend_alias()
 
 #[tokio::test]
 async fn native_actual_images_are_never_hidden_inside_textual_lowering() {
-    for kind in ["typesafe", "openrouter"] {
+    for kind in ["typesafe", "openrouter", "gemini"] {
         let native = Mock::new(vec![]).await;
         let openai = Mock::new(vec![Reply::ok(success()), Reply::ok(success())]).await;
         let gw = gateway(config_value(
@@ -1378,6 +1439,10 @@ fn official_native_endpoints_and_usage_policy_are_explicit() {
         BackendKind::Openrouter.endpoint(),
         "https://openrouter.ai/api/alpha/decisions"
     );
+    assert_eq!(
+        BackendKind::Gemini.endpoint(),
+        "https://generativelanguage.googleapis.com/v1beta/decisions"
+    );
     let cfg = config_value(json!({"a":backend("http://127.0.0.1:1234/decisions",0)}));
     let parsed = Config::from_yaml(&cfg.to_string()).unwrap();
     assert!(parsed.usage_policy == UsagePolicy::Compatible);
@@ -1414,4 +1479,261 @@ fn retry_after_supports_integer_http_date_and_past_date() {
     );
     assert_eq!(retry_after(Some("nonsense"), now), None);
     assert_eq!(retry_after(None, now), None);
+}
+
+#[tokio::test]
+async fn gemini_http_three_types_work_with_honest_usage_and_custom_headers() {
+    let gemini_response = json!({
+        "answers": {
+            "q0": {"type": "noul", "noul": 0.9},
+            "q1": {"type": "choice", "choice": "decora_choice_0", "confidence": 0.3, "probabilities": {"decora_choice_0": 0.7, "decora_choice_1": 0.3}},
+            "q2": {
+                "type": "score",
+                "score": 0.8,
+                "confidence": 0.5,
+                "legend": {
+                    "0": "低",
+                    "1": json!({"label":"高","description":"今天处理"}).to_string(),
+                },
+                "probabilities": {"0": 0.2, "1": 0.8}
+            }
+        },
+        "usage": {
+            "total_input_tokens": 120,
+            "total_output_tokens": 0,
+            "total_tokens": 120,
+            "input_tokens_by_modality": [
+                {"modality": "text", "tokens": 120}
+            ]
+        }
+    });
+    let upstream = Mock::at("/v1beta/decisions", vec![Reply::ok(gemini_response)]).await;
+    let cfg = config_value(json!({"gemini_be": native_backend(&upstream.url, "gemini", 0)}));
+    assert!(cfg.get("usage_policy").is_none());
+    let (s, _, v) = call(&gateway(cfg), native_request_three()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["model"], "decora-test");
+    assert_eq!(
+        v["answers"][0],
+        json!({"type":"predicate","name":"same","probability":0.9})
+    );
+    assert_eq!(v["answers"][1]["name"], "same");
+    assert_eq!(v["answers"][1]["choice"], "a");
+    assert_eq!(v["answers"][1]["confidence"], 0.3);
+    assert_eq!(v["answers"][1]["probabilities"][0]["probability"], 0.7);
+    assert_eq!(v["answers"][2]["score"], 0.8);
+    assert_eq!(v["answers"][2]["probabilities"][1]["label"], "高");
+    assert_eq!(v["usage"]["input_tokens"], 120);
+    assert_eq!(v["usage"]["output_tokens"], 0);
+    assert_eq!(v["usage"]["total_tokens"], 120);
+    assert!(v["usage"].get("input_tokens_details").is_none());
+    assert!(v["usage"].get("output_tokens_details").is_none());
+    assert_eq!(v["usage"]["decora"]["provider"], "gemini");
+    assert_eq!(
+        v["usage"]["decora"]["input_tokens_basis"],
+        "total_input_tokens"
+    );
+    assert_eq!(
+        v["usage"]["decora"]["total_tokens_basis"],
+        "total_input_plus_output"
+    );
+    assert_eq!(v["usage"]["decora"]["details_complete"], false);
+    assert_eq!(
+        v["usage"]["decora"]["input_tokens_by_modality"],
+        json!([{"modality": "text", "tokens": 120}])
+    );
+    let seen = upstream.state.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0["x-goog-api-key"], "sk-offline-upstream");
+    assert!(seen[0].0.get("authorization").is_none());
+    assert_eq!(seen[0].1["input"], "工单内容");
+    assert!(seen[0].1.get("state").is_none());
+    assert_eq!(seen[0].1["questions"]["q0"]["type"], "noul");
+    assert_eq!(
+        seen[0].1["questions"]["q1"]["criteria"]["decora_choice_0"],
+        json!({"value":"a","description":"团队A"}).to_string()
+    );
+    assert_eq!(
+        seen[0].1["questions"]["q1"]["criteria"]["decora_choice_1"],
+        json!({"value":"b"}).to_string()
+    );
+    assert_eq!(
+        seen[0].1["questions"]["q2"]["criteria"],
+        json!([
+            "低",
+            json!({"label":"高","description":"今天处理"}).to_string()
+        ])
+    );
+}
+
+#[tokio::test]
+async fn gemini_handles_empty_score_label_and_boolean_chinese_choices() {
+    let request = json!({
+        "model": "decora-test",
+        "input": [{"role":"user","content":[{"type":"input_text","text":"判断"}]}],
+        "questions": [
+            {
+                "type": "choice",
+                "name": "choice_q",
+                "instructions": "选择",
+                "choices": [
+                    {"value": "售后", "description": "售后团队"},
+                    {"value": true},
+                    {"value": "decora_choice_0"},
+                    {"value": ""}
+                ]
+            },
+            {
+                "type": "score",
+                "name": "score_q",
+                "instructions": "评分",
+                "levels": [
+                    {"label": ""},
+                    {"label": "良", "description": "符合预期"}
+                ]
+            }
+        ]
+    });
+    let level0_criterion = json!({"label":"","description":Value::Null}).to_string();
+    let level1_criterion = json!({"label":"良","description":"符合预期"}).to_string();
+    let upstream_resp = json!({
+        "answers": {
+            "q0": {
+                "type": "choice",
+                "choice": "decora_choice_0",
+                "confidence": 0.8,
+                "probabilities": {
+                    "decora_choice_0": 0.7,
+                    "decora_choice_1": 0.1,
+                    "decora_choice_2": 0.1,
+                    "decora_choice_3": 0.1,
+                }
+            },
+            "q1": {
+                "type": "score",
+                "score": 0.8,
+                "confidence": 0.9,
+                "legend": {
+                    "0": level0_criterion,
+                    "1": level1_criterion,
+                },
+                "probabilities": {
+                    "0": 0.2,
+                    "1": 0.8,
+                }
+            }
+        },
+        "usage": {
+            "total_input_tokens": 50,
+            "total_output_tokens": 0,
+            "total_tokens": 50,
+        }
+    });
+    let upstream = Mock::at("/v1beta/decisions", vec![Reply::ok(upstream_resp)]).await;
+    let (s, _, v) = call(
+        &gateway(config_value(
+            json!({"a": native_backend(&upstream.url, "gemini", 0)}),
+        )),
+        request,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["answers"][0]["choice"], "售后");
+    assert_eq!(v["answers"][1]["probabilities"][0]["label"], "");
+    assert_eq!(v["answers"][1]["probabilities"][1]["label"], "良");
+    assert_eq!(v["answers"][1]["score"], 0.8);
+    let seen = upstream.state.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].1["questions"]["q1"]["criteria"],
+        json!([level0_criterion, level1_criterion])
+    );
+}
+
+#[tokio::test]
+async fn gemini_invalid_usage_modality_and_protocol_errors_do_not_fake_or_retry() {
+    let mut cases = Vec::new();
+    let base = json!({
+        "answers": {
+            "q0": {"type": "noul", "noul": 0.8}
+        },
+        "usage": {
+            "total_input_tokens": 100,
+            "total_output_tokens": 0,
+            "total_tokens": 100
+        }
+    });
+    let mut c1 = base.clone();
+    c1["usage"]["total_input_tokens"] = json!(-1);
+    cases.push(c1);
+    let mut c2 = base.clone();
+    c2["usage"]["total_output_tokens"] = json!(-5);
+    cases.push(c2);
+    let mut c3 = base.clone();
+    c3["usage"]["total_tokens"] = json!(105);
+    cases.push(c3);
+    let mut c4 = base.clone();
+    c4["usage"]["input_tokens_by_modality"] = json!("not-an-array");
+    cases.push(c4);
+    let mut c5 = base.clone();
+    c5["usage"]["input_tokens_by_modality"] = json!([{"modality": "", "tokens": 100}]);
+    cases.push(c5);
+    let mut c6 = base.clone();
+    c6["usage"]["input_tokens_by_modality"] = json!([{"modality": "text", "tokens": -1}]);
+    cases.push(c6);
+    let mut c7 = base.clone();
+    c7["model"] = json!("");
+    cases.push(c7);
+    let mut c8 = base.clone();
+    c8["answers"]["q0"] = json!({"type": "refusal"});
+    cases.push(c8);
+
+    let count = cases.len();
+    let upstream = Mock::at(
+        "/v1beta/decisions",
+        cases.into_iter().map(Reply::ok).collect(),
+    )
+    .await;
+    let fallback = Mock::new(vec![]).await;
+    let gw = gateway(config_value(
+        json!({"a": native_backend(&upstream.url, "gemini", 0), "b": backend(&fallback.url, 1)}),
+    ));
+    for _ in 0..count {
+        let (s, _, v) = call(&gw, predicate()).await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+        assert_eq!(v["error"]["code"], "upstream_protocol_error");
+    }
+    assert_eq!(upstream.count(), count);
+    assert_eq!(fallback.count(), 0);
+}
+
+#[tokio::test]
+async fn gemini_fallback_and_boundaries() {
+    let a = Mock::at("/v1beta/decisions", vec![Reply::status(503)]).await;
+    let b = Mock::at("/v1/systemone", vec![Reply::ok(native_success_three())]).await;
+    let cfg = config_value(
+        json!({"a": native_backend(&a.url, "gemini", 0), "b": native_backend(&b.url, "typesafe", 1)}),
+    );
+    let (s, _, v) = call(&gateway(cfg), native_request_three()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(a.count(), 1);
+    assert_eq!(b.count(), 1);
+    assert_eq!(v["usage"]["decora"]["provider"], "typesafe");
+
+    let native = Mock::at("/v1beta/decisions", vec![]).await;
+    let mut strict_cfg = config_value(json!({"a": native_backend(&native.url, "gemini", 0)}));
+    strict_cfg["usage_policy"] = json!("strict");
+    let (s, _, v) = call(&gateway(strict_cfg), predicate()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "unsupported_usage");
+    assert_eq!(native.count(), 0);
+
+    let mut img_req = predicate();
+    img_req["input"] = json!([{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/a.png"}]}]);
+    let mut img_backend = native_backend(&native.url, "gemini", 0);
+    img_backend["capabilities"]["images"] = json!(true);
+    let img_cfg = config_value(json!({"a": img_backend}));
+    let (s, _, v) = call(&gateway(img_cfg), img_req).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "unsupported_native_images");
+    assert_eq!(native.count(), 0);
 }
