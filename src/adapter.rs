@@ -2,7 +2,10 @@
 use crate::{
     config::{Backend, BackendKind, UsagePolicy},
     error::ApiError,
-    protocol::{Answer, ChoiceValue, DecisionRequest, DecisionResponse, Question, Requirements},
+    protocol::{
+        Answer, ChoiceOption, ChoiceValue, DecisionRequest, DecisionResponse, Question,
+        Requirements, ScoreLevel,
+    },
 };
 use serde_json::{Map, Value, json};
 
@@ -70,18 +73,35 @@ fn validate_native_request(req: &DecisionRequest) -> Result<(), ApiError> {
     }
     Ok(())
 }
-fn choice_key(choices: &[crate::protocol::ChoiceOption], index: usize) -> String {
-    if choices
-        .iter()
-        .any(|c| matches!(c.value, ChoiceValue::Bool(_)))
+fn choice_key_for(choices: &[ChoiceOption], index: usize, kind: BackendKind) -> String {
+    if kind == BackendKind::Gemini
+        || choices
+            .iter()
+            .any(|c| matches!(c.value, ChoiceValue::Bool(_)))
     {
-        // 全组选项统一重命名，原始字符串即使等于内部键也不会碰撞。
+        // Gemini 或含布尔选项组统一重命名，避免非 ASCII/空串限制及同名字符串碰撞。
         format!("decora_choice_{index}")
     } else {
         let ChoiceValue::String(s) = &choices[index].value else {
             unreachable!("all strings")
         };
         s.clone()
+    }
+}
+fn score_criterion(level: &ScoreLevel, kind: BackendKind) -> Value {
+    if kind == BackendKind::Gemini {
+        match &level.description {
+            Some(d) => json!(json!({"label": level.label, "description": d}).to_string()),
+            None if level.label.is_empty() => {
+                json!(json!({"label": level.label, "description": Value::Null}).to_string())
+            }
+            None => json!(level.label),
+        }
+    } else {
+        match &level.description {
+            Some(d) => json!({"label": level.label, "description": d}),
+            None => json!(level.label),
+        }
     }
 }
 fn textual(value: &Value, kind: &str) -> Value {
@@ -93,8 +113,7 @@ fn textual(value: &Value, kind: &str) -> Value {
         json!({"decora_encoding":"openai_decisions_text_v1","kind":kind,"data":value}).to_string()
     )
 }
-/// 自动将固定 OpenAI 请求转换为上游原生 body；转换是网关内部实现，不是客户端 API。
-/// 角色/JSON 编码保留数据，不冒充原生角色指令层级；真实图片、缓存和 safety 仍独立筛选。
+/// 自动将标准中间请求转换为上游原生 body；转换是网关内部实现，不是客户端 API。
 pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError> {
     native_body_for(req, model, BackendKind::Openrouter)
 }
@@ -108,64 +127,44 @@ pub fn native_body_for(
     validate_native_request(req)?;
     let mut questions = Map::new();
     for (index, q) in req.questions.iter().enumerate() {
-        let mut question = json!({"type": q.kind(), "instructions": textual(q.instructions(), "question_content")});
+        let mut question = json!({
+            "type": q.kind(),
+            "instructions": textual(q.instructions(), "question_content"),
+        });
         match q {
             Question::Predicate { .. } => question["type"] = json!("noul"),
             Question::Choice { choices, .. } => {
+                let typed = choices
+                    .iter()
+                    .any(|c| matches!(c.value, ChoiceValue::Bool(_)));
                 let mut criteria = Map::new();
-                if kind == BackendKind::Gemini {
-                    for (i, choice) in choices.iter().enumerate() {
-                        let criterion_str = match &choice.description {
+                for (i, choice) in choices.iter().enumerate() {
+                    let criterion = if kind == BackendKind::Gemini {
+                        let s = match &choice.description {
                             Some(d) => json!({"value": choice.value, "description": d}).to_string(),
                             None => json!({"value": choice.value}).to_string(),
                         };
-                        criteria.insert(format!("decora_choice_{i}"), json!(criterion_str));
-                    }
-                } else {
-                    let typed = choices
-                        .iter()
-                        .any(|c| matches!(c.value, ChoiceValue::Bool(_)));
-                    for (i, choice) in choices.iter().enumerate() {
-                        let criterion = if typed {
-                            let mut criterion = json!({"value":choice.value});
-                            if let Some(description) = &choice.description {
-                                criterion["description"] = json!(description);
-                            }
-                            criterion
-                        } else {
-                            json!(choice.description)
-                        };
-                        criteria.insert(choice_key(choices, i), criterion);
-                    }
+                        json!(s)
+                    } else if typed {
+                        let mut c = json!({"value": choice.value});
+                        if let Some(description) = &choice.description {
+                            c["description"] = json!(description);
+                        }
+                        c
+                    } else {
+                        json!(choice.description)
+                    };
+                    criteria.insert(choice_key_for(choices, i, kind), criterion);
                 }
                 question["criteria"] = Value::Object(criteria);
             }
             Question::Score { levels, .. } => {
-                if kind == BackendKind::Gemini {
-                    question["criteria"] = json!(
-                        levels
-                            .iter()
-                            .map(|l| match &l.description {
-                                Some(d) => json!({"label": l.label, "description": d}).to_string(),
-                                None if l.label.is_empty() => {
-                                    json!({"label": l.label, "description": Value::Null})
-                                        .to_string()
-                                }
-                                None => l.label.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                    );
-                } else {
-                    question["criteria"] = json!(
-                        levels
-                            .iter()
-                            .map(|l| match &l.description {
-                                Some(d) => json!({"label": l.label, "description": d}),
-                                None => json!(l.label),
-                            })
-                            .collect::<Vec<_>>()
-                    );
-                }
+                question["criteria"] = json!(
+                    levels
+                        .iter()
+                        .map(|l| score_criterion(l, kind))
+                        .collect::<Vec<_>>()
+                );
             }
         }
         // 公开名称可重复、可省略；内部键稳定且无碰撞，原名称只在最终答案还原。
@@ -175,16 +174,16 @@ pub fn native_body_for(
         "model": model,
         "questions": questions,
     });
-    if kind == BackendKind::Gemini {
-        root["input"] = textual(&req.input, "messages");
+    let input_field = if kind == BackendKind::Gemini {
+        "input"
     } else {
-        root["state"] = textual(&req.input, "messages");
-    }
+        "state"
+    };
+    root[input_field] = textual(&req.input, "messages");
     Ok(root)
 }
 
-/// 将 native 答案重排并转换为 OpenAI 题型形状；概率及 confidence 原样保留。
-/// 调用者仍须用 DecisionResponse::parse 校验概率和与期望。返回值没有 usage，不能独立用作 API 响应。
+/// 将 native 答案重排并转换为标准中间答案形状；概率及 confidence 原样保留。
 pub fn native_answers(value: &Value, req: &DecisionRequest) -> Result<Vec<Answer>, ApiError> {
     native_answers_for(value, req, BackendKind::Openrouter)
 }
@@ -195,7 +194,7 @@ pub fn native_answers_for(
     req: &DecisionRequest,
     kind: BackendKind,
 ) -> Result<Vec<Answer>, ApiError> {
-    let body = native_body_for(req, "schema-validation", kind)?;
+    validate_native_request(req)?;
     let answers = value
         .get("answers")
         .and_then(Value::as_object)
@@ -226,15 +225,8 @@ pub fn native_answers_for(
                     return Err(ApiError::protocol());
                 }
                 let selected = a["choice"].as_str().ok_or_else(ApiError::protocol)?;
-                let get_key = |i: usize| {
-                    if kind == BackendKind::Gemini {
-                        format!("decora_choice_{i}")
-                    } else {
-                        choice_key(choices, i)
-                    }
-                };
                 let selected_index = (0..choices.len())
-                    .find(|i| get_key(*i) == selected)
+                    .find(|i| choice_key_for(choices, *i, kind) == selected)
                     .ok_or_else(ApiError::protocol)?;
                 answer["choice"] = json!(choices[selected_index].value);
                 answer["confidence"] = a["confidence"].clone();
@@ -243,7 +235,10 @@ pub fn native_answers_for(
                         .iter()
                         .enumerate()
                         .map(|(i, c)| {
-                            json!({"value": c.value, "probability": probs.get(&get_key(i))})
+                            json!({
+                                "value": c.value,
+                                "probability": probs.get(&choice_key_for(choices, i, kind)),
+                            })
                         })
                         .collect::<Vec<_>>()
                 );
@@ -259,14 +254,26 @@ pub fn native_answers_for(
                 if probs.len() != levels.len() || legend.len() != levels.len() {
                     return Err(ApiError::protocol());
                 }
-                for i in 0..levels.len() {
-                    if legend.get(&i.to_string()) != Some(&body["questions"][&key]["criteria"][i]) {
+                for (i, level) in levels.iter().enumerate() {
+                    if legend.get(&i.to_string()) != Some(&score_criterion(level, kind)) {
                         return Err(ApiError::protocol());
                     }
                 }
                 answer["score"] = a["score"].clone();
                 answer["confidence"] = a["confidence"].clone();
-                answer["probabilities"] = json!(levels.iter().enumerate().map(|(i,l)| json!({"value": i, "label": l.label, "probability": probs.get(&i.to_string())})).collect::<Vec<_>>());
+                answer["probabilities"] = json!(
+                    levels
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| {
+                            json!({
+                                "value": i,
+                                "label": l.label,
+                                "probability": probs.get(&i.to_string()),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                );
             }
         }
         output.push(serde_json::from_value(answer).map_err(|_| ApiError::protocol())?);
@@ -274,7 +281,15 @@ pub fn native_answers_for(
     Ok(output)
 }
 
-/// 将官方原生响应转换为核心 OpenAI 答案及透明的 usage 兼容扩展。
+fn token_i32(source: &Map<String, Value>, key: &str) -> Result<i32, ApiError> {
+    source
+        .get(key)
+        .and_then(Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(ApiError::protocol)
+}
+
+/// 将官方原生响应转换为核心答案及透明的 usage 兼容扩展。
 /// input/output 直接来自上游；total 是显式标记口径的两数之和，未知明细不补零。
 pub fn native_response(
     value: Value,
@@ -301,25 +316,12 @@ pub fn native_response(
     let source = value["usage"].as_object().ok_or_else(ApiError::protocol)?;
 
     if kind == BackendKind::Gemini {
-        let token = |key: &str| {
-            source
-                .get(key)
-                .and_then(Value::as_i64)
-                .and_then(|n| i32::try_from(n).ok())
-                .filter(|n| *n >= 0)
-                .ok_or_else(ApiError::protocol)
-        };
-        let total_input_tokens = token("total_input_tokens")?;
-        let total_output_tokens = token("total_output_tokens")?;
-        let total_tokens = token("total_tokens")?;
-        if total_input_tokens.checked_add(total_output_tokens) != Some(total_tokens) {
+        let total_input = token_i32(source, "total_input_tokens")?;
+        let total_output = token_i32(source, "total_output_tokens")?;
+        let total = token_i32(source, "total_tokens")?;
+        if total_input.checked_add(total_output) != Some(total) {
             return Err(ApiError::protocol());
         }
-        let mut usage = json!({
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "total_tokens": total_tokens,
-        });
         let mut decora = json!({
             "provider": "gemini",
             "input_tokens_basis": "total_input_tokens",
@@ -327,28 +329,17 @@ pub fn native_response(
             "details_complete": false,
         });
         if let Some(modality) = source.get("input_tokens_by_modality") {
-            let items = modality.as_array().ok_or_else(ApiError::protocol)?;
-            for item in items {
-                let obj = item.as_object().ok_or_else(ApiError::protocol)?;
-                let modality_name = obj
-                    .get("modality")
-                    .and_then(Value::as_str)
-                    .ok_or_else(ApiError::protocol)?;
-                if modality_name.is_empty() {
-                    return Err(ApiError::protocol());
-                }
-                let tokens = obj
-                    .get("tokens")
-                    .and_then(Value::as_i64)
-                    .and_then(|n| i32::try_from(n).ok())
-                    .ok_or_else(ApiError::protocol)?;
-                if tokens < 0 {
-                    return Err(ApiError::protocol());
-                }
+            if !modality.is_array() {
+                return Err(ApiError::protocol());
             }
-            decora["input_tokens_by_modality"] = json!(items);
+            decora["input_tokens_by_modality"] = modality.clone();
         }
-        usage["decora"] = decora;
+        let usage = json!({
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "total_tokens": total,
+            "decora": decora,
+        });
         return DecisionResponse::parse_with_usage(
             json!({"model": req.model, "answers": answers, "usage": usage}),
             req,
@@ -356,15 +347,8 @@ pub fn native_response(
         );
     }
 
-    let token = |key: &str| {
-        source
-            .get(key)
-            .and_then(Value::as_i64)
-            .and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(ApiError::protocol)
-    };
-    let input = token("input_tokens")?;
-    let output = token("output_tokens")?;
+    let input = token_i32(source, "input_tokens")?;
+    let output = token_i32(source, "output_tokens")?;
     let total = input.checked_add(output).ok_or_else(ApiError::protocol)?;
     if source
         .get("total_tokens")
@@ -372,7 +356,7 @@ pub fn native_response(
     {
         return Err(ApiError::protocol());
     }
-    let mut usage = json!({"input_tokens":input,"output_tokens":output,"total_tokens":total});
+    let mut usage = json!({"input_tokens": input, "output_tokens": output, "total_tokens": total});
     for (field, known) in [
         (
             "input_tokens_details",
@@ -427,7 +411,7 @@ pub fn native_response(
         usage["decora"]["provider_cost"] = json!(cost);
     }
     DecisionResponse::parse_with_usage(
-        json!({"model":value["model"],"answers":answers,"usage":usage}),
+        json!({"model": value["model"], "answers": answers, "usage": usage}),
         req,
         policy,
     )

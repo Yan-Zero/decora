@@ -1,8 +1,15 @@
 # Decora
 
-**Decora 是一个 Rust 实现的独立 Decisions 协议网关。所有公开 model alias 一律使用同一个 `POST /v1/decisions`：固定 OpenAI 形状的 `model / input / questions` 请求与 predicate、choice、score、refusal 核心答案。** 客户端不提交 Jev/OpenRouter 格式、不选择转换策略，也不使用上游的 state/criteria 参数。OpenAI、Gemini、OpenRouter、TypeSafe/Jev 之间的格式转换由网关自动完成，不调用聊天接口，不伪造概率。
+**Decora 是一个 Rust 实现的独立多方言 Decisions 协议网关。** 所有公开 model alias 同时支持四类官方形状的入站端点（另有 `GET /healthz`），通过 **“多前端方言（Dialect） ↔ 内部标准中间表示（Canonical Decision IR） ↔ 多后端适配器（Adapter）”** 的对称中心辐射式（Hub-and-Spoke）架构，使不同生态的 SDK 与客户端无需改写请求即可跨任意兼容上游路由与故障回退：
 
-文字、角色消息、JSON parts 和布尔/字符串混合 choice 均自动适配；图片等真实能力仍先筛选。**尚存的合同例外是 usage**：默认服务端 `usage_policy: compatible` 保留真实已知统计、允许省略未知明细，并添加 `usage.decora` 标记，**并非严格完全符合 OpenAI usage schema**。TypeSafe billable input 与 Gemini `total_input_tokens` 不能冒充精确总输入，未知值也不填 0。管理员可在服务端选择 usage strict；该选项不属于客户端请求。详见[协议与能力矩阵](docs/PROTOCOL.md)。
+- `POST /v1/decisions`：OpenAI Decisions 方言（`model / input / questions[]`，题型 `predicate / choice / score`）
+- `POST /v1beta/decisions`：Google Gemini Decisions 方言（`model / input / questions{}`，题型 `noul / choice / score`，支持纯文本及 `text / inline_data` 多模态数组）
+- `POST /v0/decisions`：TypeSafe (Jev) Decisions 方言（`model / state / questions{}`，题型 `noul / choice / score`）
+- `POST /api/v1/decisions`：OpenRouter Decisions 方言（`model / state / questions{}`，题型 `noul / choice / score`）
+
+每个入站端点严格校验其官方方言 Schema（例如向 `/v1/decisions` 发送 `state` 或向 `/v0/decisions` 发送数组 `questions` 均返回 `400 invalid_request`），不提供任何客户端“转换策略”开关。OpenAI、Gemini、OpenRouter、TypeSafe/Jev 之间的格式转换由网关自动完成，不调用聊天接口，不伪造概率。
+
+文字、角色消息、JSON parts 和布尔/字符串混合 choice 均自动适配；图片等真实能力仍先筛选。**尚存的合同例外是 usage**：默认服务端 `usage_policy: compatible` 保留真实已知统计、允许省略未知明细，并添加 `usage.decora` 标记，**并非严格完全符合目标方言或 OpenAI 的原生 usage schema**。TypeSafe billable input 与 Gemini `total_input_tokens` 不能冒充精确总输入，未知值也不填 0。管理员可在服务端选择 usage strict；该选项不属于客户端请求。详见[协议与能力矩阵](docs/PROTOCOL.md)。
 
 ## 快速开始
 
@@ -25,7 +32,7 @@ export DECORA_BEARER_KEY
 cargo run --locked --release -- config.yaml
 ```
 
-`DECORA_BEARER_KEY` 应使用单独生成的高熵随机值，不要复用上游 API key。配置中的所有后端凭据都会在启动时解析，缺失/空白/换行等异常会阻止启动，程序不会输出其内容。
+`DECORA_BEARER_KEY` 应使用单独生成的高熵随机值，不要复用上游 API key。入站鉴权同时支持 `Authorization: Bearer $DECORA_BEARER_KEY` 与 `x-goog-api-key: $DECORA_BEARER_KEY`（单次请求只允许提供一种有效凭据，同时携带两种或重复头均返回 `401 invalid_api_key`，且绝不向上游转发）。配置中的所有后端凭据都会在启动时解析，缺失/空白/换行等异常会阻止启动，程序不会输出其内容。
 
 ```bash
 curl http://127.0.0.1:8787/healthz
@@ -185,7 +192,7 @@ OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID�
 3. 每个请求最多 `max_attempts` 次**总调用**，包括首次；候选全部尝试完后可从该次排列首位开始下一轮。没有运行时模型发现或后台探测。
 4. 仅连接失败、发送阶段超时、HTTP `429/500/502/503/504` 允许按候选顺序回退或重试；等待带有界指数退避及抖动。
 5. `429 Retry-After` 支持整数秒和 HTTP 日期，在尝试任何下一个候选之前等待。若等待将超过剩余总预算，则立即返回 429 及剩余建议等待秒数，不缩短上游要求的等待。
-6. 客户端错误、上游鉴权错误、拒答、非法概率、必需 usage 计数缺失/非法、重定向、成功头之后的响应体传输失败都**不回退**。OpenAI 拒答以 HTTP 200 的 `type: refusal` 保留；同批其他答案照常返回。OpenRouter/Jev 官方未定义逐题拒答答案；遇到未定义类型返回协议错误，不伪造否定答案、不盲目切换模型。
+6. 客户端错误、上游鉴权错误、拒答、非法概率、必需 usage 计数缺失/非法、重定向、成功头之后的响应体传输失败都**不回退**。OpenAI 入口对 OpenAI 上游的拒答以 HTTP 200 的 `type: refusal` 保留；同批其他答案照常返回。若非 OpenAI 入站端点（`/v1beta/decisions`、`/v0/decisions`、`/api/v1/decisions`）遇到 OpenAI 上游返回逐题 `refusal`，由于目标方言无逐题拒答结构，网关返回 `502 upstream_refusal_unrepresentable`，绝不伪造概率、不盲目切换模型。Gemini/OpenRouter/Jev 官方未定义逐题拒答答案；遇到未定义类型返回协议错误，不伪造否定答案、不盲目切换模型。
 
 `attempt_timeout_ms` 覆盖一次上游发送及响应体读取；`request_timeout_ms` 覆盖入站 body 读取、所有尝试和等待。默认分别为 30 秒和 60 秒。响应体也受单独大小限制，并发满时立即返回 503。超时重放可能导致上游重复计费；Decisions 没有在本项目中验证过的幂等凭据合同，需要绝对避免重复调用时将 `max_attempts: 1`。
 
@@ -199,7 +206,7 @@ OpenRouter 的等价配置使用 `kind: openrouter`、账户可用的模型 ID�
 - 日志只记录固定消息、尝试次数和固定错误码；不记录输入、问题、响应正文、密钥、上游 URL、alias 或 YAML 内容。启动器固定启用 `decora=info`，不会接受 `RUST_LOG` 开启 HTTP 客户端的敏感 debug 日志。
 - 对外错误统一采用 `{"error":{"message":...,"type":...,"param":null,"code":...}}`，不回显上游错误正文。
 
-常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_native_images`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
+常见错误码：`invalid_request`、`unsupported_content`、`unsupported_tool_history`、`image_limit_exceeded`、`model_not_found`、`unsupported_capability`、`unsupported_native_mapping`、`unsupported_native_images`、`unsupported_usage`、`invalid_api_key`、`rate_limit_exceeded`、`upstream_protocol_error`、`upstream_refusal_unrepresentable`、`upstream_client_error`、`upstream_timeout`、`gateway_busy`。
 
 ## 离线验证
 
@@ -210,9 +217,9 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-2026-11-04 实际结果：**34 项测试通过**（1 项单测 + 33 项集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查也无漏洞或维护警告。详细过程见 `HANDOFF.md`。
+2026-11-13 实际结果：**42 项测试通过**（1 项单测 + 41 项离线集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查无漏洞（仅 1 项已允许的 yanked 维护提醒）。详细过程见 `HANDOFF.md`。
 
-测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）的三题型 HTTP 往返、所有后端 alias 使用相同 OpenAI 请求和核心 answers 的回归、上游专有请求形状拒绝、Gemini/OpenRouter→TypeSafe 实际协议回退、服务端 usage compatible/strict 选项、Gemini total_input_tokens 与 TypeSafe billable input 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权（Bearer 与 x-goog-api-key）、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
+测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、四类入站端点（`/v1/decisions`、`/v1beta/decisions`、`/v0/decisions`、`/api/v1/decisions`）与四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）的三题型 HTTP 往返、Gemini `inline_data` 图片数组入站路由至 OpenAI 视觉后端、所有后端 alias 使用相同 OpenAI 请求和核心 answers 的回归、方言 Schema 越界与上游专有请求形状拒绝、Gemini/OpenRouter→TypeSafe/OpenAI 实际协议回退、非 OpenAI 入站遇到 OpenAI 逐题 `refusal` 返回 `502 upstream_refusal_unrepresentable`、服务端 usage compatible/strict 选项、Gemini `total_input_tokens` 与 TypeSafe `billable_input` 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权（Bearer 与 x-goog-api-key 及双头冲突拒绝）、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
 
 ## 上线前需要完成
 
@@ -228,9 +235,10 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ## 文件
 
-- `src/config.rs`：配置和凭据解析；`src/protocol.rs`：请求/响应合同。
-- `src/adapter.rs`：能力边界和原生协议映射；`src/gateway.rs`：HTTP/路由/重试。
-- `tests/offline.rs`：离线集成测试；`docs/PROTOCOL.md`：官方依据及能力矩阵。
+- `src/config.rs`：配置和凭据解析；`src/protocol.rs`：Canonical 内部标准请求/响应中间表示与校验。
+- `src/dialect.rs`：四类入站方言（OpenAI、Gemini、TypeSafe、OpenRouter）的严格解析与格式化。
+- `src/adapter.rs`：能力边界和四类原生上游协议映射；`src/gateway.rs`：HTTP/多端点路由/双轨鉴权/重试。
+- `tests/offline.rs`：离线集成测试；`docs/PROTOCOL.md`：官方依据、Hub-and-Spoke 架构及能力矩阵。
 - `HANDOFF.md`：开发过程、实际检查结果与接续信息。
 
 ## 官方资料来源

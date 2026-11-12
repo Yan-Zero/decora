@@ -1,14 +1,21 @@
 # Decora 产品概述
 
-Decora 是 Rust 实现的独立 **OpenAI Decisions 协议网关**。所有公开 model alias 统一提供 `POST /v1/decisions`（另有 `GET /healthz`），请求固定为 OpenAI 形状的 `model / input / questions`，答案为 predicate、choice、score、refusal 四类核心答案。
+Decora 是 Rust 实现的独立**多方言 Decisions 协议网关**。所有公开 model alias 同时支持四类官方形状的入站端点（另有 `GET /healthz`）：
+
+- `POST /v1/decisions`：OpenAI Decisions 方言（`model / input / questions[]`，题型 `predicate / choice / score`）
+- `POST /v1beta/decisions`：Google Gemini Decisions 方言（`model / input / questions{}`，题型 `noul / choice / score`）
+- `POST /v0/decisions`：TypeSafe (Jev) Decisions 方言（`model / state / questions{}`，题型 `noul / choice / score`）
+- `POST /api/v1/decisions`：OpenRouter Decisions 方言（`model / state / questions{}`，题型 `noul / choice / score`）
+
+网关采用 **“多前端方言（Dialect） ↔ 内部标准中间表示（Canonical Decision IR） ↔ 多后端适配器（Adapter）”** 的对称中心辐射式（Hub-and-Spoke）架构，使任意 Decisions 客户端都能零改造接入并跨任意兼容上游路由与故障回退。
 
 ## 核心原则（修改前必须理解）
 
-1. **外部合同固定**：客户端永远只发 OpenAI Decisions 请求，不选择上游协议、不提交 Jev/OpenRouter 的 `state/criteria/noul` 格式、不提供任何“转换策略”开关。发送上游专有字段或转换控制字段一律 400。
-2. **转换是网关内部职责**：OpenAI、Gemini、OpenRouter、TypeSafe/Jev 之间的格式转换由 `adapter` 自动完成；不调用聊天接口、不伪造概率。
-3. **不伪造数据**：未知 usage 明细省略而不是填 0；不重归一化、裁剪或重算上游概率；不合成缺失的 confidence；Gemini/OpenRouter/Jev 的未知答案类型报协议错误，不映射成否定答案。
-4. **已知合同例外（必须诚实标注）**：默认 `usage_policy: compatible` 可省略 OpenAI 必需的 usage 明细并增加 `usage.decora` 扩展，**不是严格完整的 OpenAI schema**。不得在文档或代码注释中宣称“响应完全一致”。`strict` 是服务端选项，不是客户端参数。
-5. **公开 `model` 返回请求 alias**，不暴露内部后端 ID、URL 或凭据。
+1. **各端点外部合同严格固定**：每个入站端点只接受其对应官方方言的请求形状，不混用其他方言专有字段（例如向 `/v1/decisions` 发送 `state/criteria` 或向 `/v0/decisions` 发送 `questions` 数组一律返回 `400 invalid_request`），也不提供任何客户端“转换策略”开关。
+2. **转换是网关内部职责**：任意入站方言与任意出站上游（OpenAI、Gemini、OpenRouter、TypeSafe/Jev）之间的协议转换由 `dialect` 与 `adapter` 通过内部标准中间表示自动完成；不调用聊天接口、不伪造概率。
+3. **不伪造数据**：未知 usage 明细省略而不是填 0；不重归一化、裁剪或重算上游概率；不合成缺失的 confidence；未知答案类型报协议错误；若 OpenAI 上游返回逐题 `refusal` 而当前入站方言（Gemini / TypeSafe / OpenRouter）不支持逐题拒答表达，明确返回 `502 upstream_refusal_unrepresentable`，绝不把拒答伪造成 `0.0` 或其他概率。
+4. **已知合同例外（必须诚实标注）**：默认 `usage_policy: compatible` 可省略目标方言未知的 usage 明细并增加 `usage.decora` 扩展，**不是严格完整的原生 usage schema**。不得在文档或代码注释中宣称“响应完全一致”。`strict` 是服务端选项，不是客户端参数。
+5. **公开 `model` 返回请求 alias**，不暴露内部后端 ID、URL 或凭据。入站鉴权同时支持 `Authorization: Bearer <token>` 与 `x-goog-api-key: <token>`（单次请求只允许提供一种有效凭据，且绝不向上游转发）。
 6. **能力筛选仍然真实**：图片、题型、题数、缓存、safety 参数、usage 要求会在发起网络调用前筛选候选；图片不会被编码成文本冒充已分析。
 
 ## 范围边界

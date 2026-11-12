@@ -1737,3 +1737,470 @@ async fn gemini_fallback_and_boundaries() {
     assert_eq!(v["error"]["code"], "unsupported_native_images");
     assert_eq!(native.count(), 0);
 }
+
+async fn call_with_header(
+    gateway: &Gateway,
+    path: &str,
+    body: String,
+    headers: Vec<(&str, &str)>,
+) -> (StatusCode, HeaderMap, Value) {
+    let mut req = axum::http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let response = gateway
+        .router()
+        .oneshot(req.body(axum::body::Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| json!({"raw":String::from_utf8_lossy(&bytes)}));
+    (status, resp_headers, value)
+}
+
+#[tokio::test]
+async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai() {
+    let gemini_request = json!({
+        "model": "decora-test",
+        "input": "包裹有折痕，请评估。",
+        "questions": {
+            "a_damaged": {"type": "noul", "instructions": "是否损坏？"},
+            "b_route": {
+                "type": "choice",
+                "instructions": "分给谁？",
+                "criteria": {"a_support": "客服", "b_sales": ""}
+            },
+            "c_level": {
+                "type": "score",
+                "instructions": "紧迫性",
+                "criteria": ["低", "高"]
+            }
+        }
+    });
+
+    // 1) 直连 Gemini 后端，使用 x-goog-api-key 入站鉴权
+    let gemini_upstream_resp = json!({
+        "answers": {
+            "q0": {"type": "noul", "noul": 0.9},
+            "q1": {
+                "type": "choice",
+                "choice": "decora_choice_0",
+                "confidence": 0.8,
+                "probabilities": {"decora_choice_0": 0.85, "decora_choice_1": 0.15}
+            },
+            "q2": {
+                "type": "score",
+                "score": 0.7,
+                "confidence": 0.6,
+                "legend": {"0": "低", "1": "高"},
+                "probabilities": {"0": 0.3, "1": 0.7}
+            }
+        },
+        "usage": {
+            "total_input_tokens": 80,
+            "total_output_tokens": 0,
+            "total_tokens": 80,
+            "input_tokens_by_modality": [{"modality": "text", "tokens": 80}]
+        }
+    });
+    let gemini_mock = Mock::at("/v1beta/decisions", vec![Reply::ok(gemini_upstream_resp)]).await;
+    let gw = gateway(config_value(
+        json!({"gem": native_backend(&gemini_mock.url, "gemini", 0)}),
+    ));
+    let (s, _, v) = call_with_header(
+        &gw,
+        "/v1beta/decisions",
+        gemini_request.to_string(),
+        vec![("x-goog-api-key", "offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["model"], "decora-test");
+    assert_eq!(
+        v["answers"]["a_damaged"],
+        json!({"type": "noul", "noul": 0.9})
+    );
+    assert_eq!(v["answers"]["b_route"]["choice"], "a_support");
+    assert_eq!(
+        v["answers"]["b_route"]["probabilities"],
+        json!({"a_support": 0.85, "b_sales": 0.15})
+    );
+    assert_eq!(v["answers"]["c_level"]["score"], 0.7);
+    assert_eq!(
+        v["answers"]["c_level"]["legend"],
+        json!({"0": "低", "1": "高"})
+    );
+    assert_eq!(v["usage"]["total_input_tokens"], 80);
+    assert_eq!(v["usage"]["total_output_tokens"], 0);
+    assert_eq!(v["usage"]["total_tokens"], 80);
+    assert_eq!(
+        v["usage"]["input_tokens_by_modality"],
+        json!([{"modality": "text", "tokens": 80}])
+    );
+    assert_eq!(v["usage"]["decora"]["provider"], "gemini");
+    {
+        let seen = gemini_mock.state.seen.lock().unwrap();
+        assert_eq!(seen[0].0["x-goog-api-key"], "sk-offline-upstream");
+        assert_ne!(seen[0].0["x-goog-api-key"], "offline-client-key");
+    }
+
+    // 2) Gemini 上游 503 回退至 OpenAI 后端，仍按 Gemini 响应格式返回且标明 provider: openai
+    let openai_resp = json!({
+        "model": "gpt-6-luna",
+        "answers": [
+            {"type": "predicate", "name": "a_damaged", "probability": 0.9},
+            {"type": "choice", "name": "b_route", "choice": "a_support", "confidence": 0.8, "probabilities": [{"value": "a_support", "probability": 0.85}, {"value": "b_sales", "probability": 0.15}]},
+            {"type": "score", "name": "c_level", "score": 0.7, "confidence": 0.6, "probabilities": [{"value": 0, "label": "低", "probability": 0.3}, {"value": 1, "label": "高", "probability": 0.7}]}
+        ],
+        "usage": usage()
+    });
+    let gem_503 = Mock::at("/v1beta/decisions", vec![Reply::status(503)]).await;
+    let oa_ok = Mock::at("/v1/decisions", vec![Reply::ok(openai_resp)]).await;
+    let gw_fb = gateway(config_value(json!({
+        "gem": native_backend(&gem_503.url, "gemini", 0),
+        "oa": backend(&oa_ok.url, 1),
+    })));
+    let (s, _, v) = call_with_header(
+        &gw_fb,
+        "/v1beta/decisions",
+        gemini_request.to_string(),
+        vec![("x-goog-api-key", "offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(gem_503.count(), 1);
+    assert_eq!(oa_ok.count(), 1);
+    assert_eq!(v["usage"]["total_input_tokens"], 100);
+    assert_eq!(v["usage"]["total_output_tokens"], 4);
+    assert_eq!(v["usage"]["total_tokens"], 104);
+    assert_eq!(v["usage"]["decora"]["provider"], "openai");
+    assert_eq!(
+        v["usage"]["decora"]["input_tokens_basis"],
+        "openai_input_tokens"
+    );
+    assert_eq!(
+        v["usage"]["decora"]["total_tokens_basis"],
+        "openai_input_plus_output"
+    );
+    assert_eq!(v["usage"]["decora"]["details_complete"], true);
+
+    // 3) Gemini inline_data 图片数组入站路由至 OpenAI 视觉后端，并先排除非视觉后端
+    let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    let img_req = json!({
+        "model": "decora-test",
+        "input": [
+            {"text": "检查破损图片"},
+            {"inline_data": {"mime_type": "image/png", "data": png_b64}}
+        ],
+        "questions": {
+            "has_damage": {"type": "noul", "instructions": "图片是否有破损？"}
+        }
+    });
+    let non_vision_oa = Mock::at("/v1/decisions", vec![]).await;
+    let mut non_vision_cfg = backend(&non_vision_oa.url, 0);
+    non_vision_cfg["capabilities"]["images"] = json!(false);
+    let vision_oa = Mock::at(
+        "/v1/decisions",
+        vec![Reply::ok(json!({
+            "model": "gpt-6-luna",
+            "answers": [{"type": "predicate", "name": "has_damage", "probability": 0.95}],
+            "usage": usage()
+        }))],
+    )
+    .await;
+    let gw_img = gateway(config_value(json!({
+        "non_vision": non_vision_cfg,
+        "gem_no_img": native_backend(&gem_503.url, "gemini", 0),
+        "vision_oa": backend(&vision_oa.url, 1),
+    })));
+    let (s, _, v) = call_with_header(
+        &gw_img,
+        "/v1beta/decisions",
+        img_req.to_string(),
+        vec![("x-goog-api-key", "offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(non_vision_oa.count(), 0);
+    assert_eq!(vision_oa.count(), 1);
+    assert_eq!(v["answers"]["has_damage"]["noul"], 0.95);
+    {
+        let seen = vision_oa.state.seen.lock().unwrap();
+        assert_eq!(
+            seen[0].1["input"][0]["content"][1],
+            json!({"type": "input_image", "image_url": format!("data:image/png;base64,{png_b64}")})
+        );
+    }
+
+    // 若只有非视觉后端，则拒绝而不触达网络
+    let gw_only_non_vision = gateway(config_value(json!({
+        "gem_only": native_backend(&gem_503.url, "gemini", 0),
+    })));
+    let (s, _, v) = call_with_header(
+        &gw_only_non_vision,
+        "/v1beta/decisions",
+        img_req.to_string(),
+        vec![("x-goog-api-key", "offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "unsupported_native_images");
+}
+
+#[tokio::test]
+async fn multi_dialect_typesafe_and_openrouter_inbound_with_chinese_and_score_descriptions() {
+    let ts_or_request = json!({
+        "model": "decora-test",
+        "state": "包裹外壳破损，要求退换货。",
+        "questions": {
+            "route_team": {
+                "type": "choice",
+                "instructions": "分给哪个部门？",
+                "criteria": {"售后": "处理退换", "销售": null}
+            },
+            "severity": {
+                "type": "score",
+                "instructions": "评估严重度",
+                "criteria": ["轻度", {"label": "严重", "description": "立即介入"}]
+            }
+        }
+    });
+
+    // 1) TypeSafe /v0/decisions -> Gemini 后端（Gemini 内部映射再由 dialect 还原中文选项与 score legend 对象）
+    let gem_resp = json!({
+        "answers": {
+            "q0": {
+                "type": "choice",
+                "choice": "decora_choice_0",
+                "confidence": 0.9,
+                "probabilities": {"decora_choice_0": 0.92, "decora_choice_1": 0.08}
+            },
+            "q1": {
+                "type": "score",
+                "score": 0.8,
+                "confidence": 0.75,
+                "legend": {
+                    "0": "轻度",
+                    "1": json!({"label": "严重", "description": "立即介入"}).to_string()
+                },
+                "probabilities": {"0": 0.2, "1": 0.8}
+            }
+        },
+        "usage": {
+            "total_input_tokens": 60,
+            "total_output_tokens": 0,
+            "total_tokens": 60
+        }
+    });
+    let gem_mock = Mock::at("/v1beta/decisions", vec![Reply::ok(gem_resp)]).await;
+    let gw_gem = gateway(config_value(
+        json!({"gem": native_backend(&gem_mock.url, "gemini", 0)}),
+    ));
+    let (s, _, v) = call_with_header(
+        &gw_gem,
+        "/v0/decisions",
+        ts_or_request.to_string(),
+        vec![("authorization", "Bearer offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["model"], "decora-test");
+    assert_eq!(v["answers"]["route_team"]["choice"], "售后");
+    assert_eq!(
+        v["answers"]["route_team"]["probabilities"],
+        json!({"售后": 0.92, "销售": 0.08})
+    );
+    assert_eq!(
+        v["answers"]["severity"]["legend"],
+        json!({"0": "轻度", "1": {"label": "严重", "description": "立即介入"}})
+    );
+    assert_eq!(v["usage"]["input_tokens"], 60);
+    assert_eq!(v["usage"]["output_tokens"], 0);
+    assert_eq!(v["usage"]["total_tokens"], 60);
+    assert_eq!(v["usage"]["decora"]["provider"], "gemini");
+
+    // 2) OpenRouter /api/v1/decisions -> OpenAI 后端
+    let oa_resp = json!({
+        "model": "gpt-6-luna",
+        "answers": [
+            {
+                "type": "choice",
+                "name": "route_team",
+                "choice": "售后",
+                "confidence": 0.9,
+                "probabilities": [
+                    {"value": "售后", "probability": 0.92},
+                    {"value": "销售", "probability": 0.08}
+                ]
+            },
+            {
+                "type": "score",
+                "name": "severity",
+                "score": 0.8,
+                "confidence": 0.75,
+                "probabilities": [
+                    {"value": 0, "label": "轻度", "probability": 0.2},
+                    {"value": 1, "label": "严重", "probability": 0.8}
+                ]
+            }
+        ],
+        "usage": usage()
+    });
+    let oa_mock = Mock::at("/v1/decisions", vec![Reply::ok(oa_resp)]).await;
+    let gw_oa = gateway(config_value(json!({"oa": backend(&oa_mock.url, 0)})));
+    let (s, _, v) = call_with_header(
+        &gw_oa,
+        "/api/v1/decisions",
+        ts_or_request.to_string(),
+        vec![("authorization", "Bearer offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["answers"]["route_team"]["choice"], "售后");
+    assert_eq!(
+        v["answers"]["severity"]["legend"],
+        json!({"0": "轻度", "1": {"label": "严重", "description": "立即介入"}})
+    );
+    assert_eq!(v["usage"]["decora"]["provider"], "openai");
+    assert_eq!(v["usage"]["decora"]["details_complete"], true);
+}
+
+#[tokio::test]
+async fn strict_dialect_boundaries_and_dual_auth_conflict_rejections() {
+    let upstream = Mock::new(vec![]).await;
+    let gw = gateway(config_value(json!({"oa": backend(&upstream.url, 0)})));
+
+    // 1) 向 /v1/decisions 发送 state 或对象 questions -> 400 invalid_request
+    for body in [
+        json!({"model": "decora-test", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
+        json!({"model": "decora-test", "input": "x", "questions": {"q0": {"type": "predicate", "instructions": "q"}}}),
+    ] {
+        let (s, _, v) = call_with_header(
+            &gw,
+            "/v1/decisions",
+            body.to_string(),
+            vec![("authorization", "Bearer offline-client-key")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["code"], "invalid_request");
+    }
+
+    // 2) 向 /v1beta/decisions 发送 state、数组 questions 或 predicate -> 400 invalid_request
+    for body in [
+        json!({"model": "decora-test", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
+        json!({"model": "decora-test", "input": "x", "questions": [{"type": "predicate", "instructions": "q"}]}),
+        json!({"model": "decora-test", "input": "x", "questions": {"q0": {"type": "predicate", "instructions": "q"}}}),
+    ] {
+        let (s, _, v) = call_with_header(
+            &gw,
+            "/v1beta/decisions",
+            body.to_string(),
+            vec![("x-goog-api-key", "offline-client-key")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["code"], "invalid_request");
+    }
+
+    // 3) 向 /v0/decisions 与 /api/v1/decisions 发送 input 或数组 questions -> 400 invalid_request
+    for path in ["/v0/decisions", "/api/v1/decisions"] {
+        for body in [
+            json!({"model": "decora-test", "input": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
+            json!({"model": "decora-test", "state": "x", "questions": [{"type": "noul", "instructions": "q"}]}),
+        ] {
+            let (s, _, v) = call_with_header(
+                &gw,
+                path,
+                body.to_string(),
+                vec![("authorization", "Bearer offline-client-key")],
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{path}: {v}");
+            assert_eq!(v["error"]["code"], "invalid_request");
+        }
+    }
+
+    // 4) 同时发送 Authorization 与 x-goog-api-key（或重复头） -> 401 invalid_api_key
+    for path in [
+        "/v1/decisions",
+        "/v1beta/decisions",
+        "/v0/decisions",
+        "/api/v1/decisions",
+    ] {
+        let (s, h, v) = call_with_header(
+            &gw,
+            path,
+            "{}".into(),
+            vec![
+                ("authorization", "Bearer offline-client-key"),
+                ("x-goog-api-key", "offline-client-key"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {v}");
+        assert_eq!(h["www-authenticate"], "Bearer");
+        assert_eq!(v["error"]["code"], "invalid_api_key");
+
+        let (s, _, v) = call_with_header(
+            &gw,
+            path,
+            "{}".into(),
+            vec![
+                ("x-goog-api-key", "offline-client-key"),
+                ("x-goog-api-key", "offline-client-key"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}: {v}");
+        assert_eq!(v["error"]["code"], "invalid_api_key");
+    }
+
+    assert_eq!(upstream.count(), 0);
+}
+
+#[tokio::test]
+async fn non_openai_dialect_returns_502_unrepresentable_on_openai_refusal_without_fallback() {
+    let refusal_resp = json!({
+        "model": "gpt-6-luna",
+        "answers": [{"type": "refusal", "name": "q0"}],
+        "usage": usage()
+    });
+    for (path, req_body, auth_hdr) in [
+        (
+            "/v1beta/decisions",
+            json!({"model": "decora-test", "input": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
+            ("x-goog-api-key", "offline-client-key"),
+        ),
+        (
+            "/v0/decisions",
+            json!({"model": "decora-test", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
+            ("authorization", "Bearer offline-client-key"),
+        ),
+        (
+            "/api/v1/decisions",
+            json!({"model": "decora-test", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
+            ("authorization", "Bearer offline-client-key"),
+        ),
+    ] {
+        let oa = Mock::at("/v1/decisions", vec![Reply::ok(refusal_resp.clone())]).await;
+        let fb = Mock::new(vec![]).await;
+        let gw = gateway(config_value(json!({
+            "oa": backend(&oa.url, 0),
+            "fb": native_backend(&fb.url, "gemini", 1),
+        })));
+        let (s, _, v) = call_with_header(&gw, path, req_body.to_string(), vec![auth_hdr]).await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY, "{path}: {v}");
+        assert_eq!(v["error"]["code"], "upstream_refusal_unrepresentable");
+        assert_eq!(oa.count(), 1);
+        assert_eq!(fb.count(), 0);
+    }
+}

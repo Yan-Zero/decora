@@ -1,8 +1,14 @@
 # 协议依据与兼容边界
 
-核对日期：**2026-11-04**。实现以官方 schema 为准，不把名称相似的第三方网关、博客或聊天 structured output 当作原生决策接口。
+核对日期：**2026-11-13**。实现以官方 schema 为准，不把名称相似的第三方网关、博客或聊天 structured output 当作原生决策接口。
 
-**外部只有固定 OpenAI Decisions 请求与核心 answers 合同**：所有公开 alias 都调用同一个 `/v1/decisions`，客户端不选择转换策略、不改为 state/criteria 等上游格式。以下上游映射和编码均为网关内部实现说明，不是额外公开 API。**当前整个响应仍有明确例外：compatible usage 可省略 OpenAI 必需明细并增加 usage.decora 扩展，尚不严格完全符合 OpenAI schema。** 本轮保留该服务端管理行为，不伪造未知零值。
+**外部采用对称的多方言入站端点 + Hub-and-Spoke 架构**：Decora 通过 **“多前端方言（`Dialect`） ↔ 内部标准中间表示（Canonical Decision IR） ↔ 多后端适配器（`Adapter`）”** 消除 $M \times N$ 两两转换：
+- `POST /v1/decisions`（OpenAI 方言：`model / input / questions[]`）
+- `POST /v1beta/decisions`（Google Gemini 方言：`model / input / questions{}`，支持 `text / inline_data`）
+- `POST /v0/decisions`（TypeSafe / Jev 方言：`model / state / questions{}`）
+- `POST /api/v1/decisions`（OpenRouter 方言：`model / state / questions{}`）
+
+每个入站端点严格校验其官方方言 Schema，绝不混用其他方言字段；客户端不选择转换策略。**当前整个响应仍有明确例外：compatible usage 可省略目标方言或 OpenAI 的必需明细并增加 usage.decora 扩展，尚不严格完全符合原生 usage schema。** 本轮保留该服务端管理行为，不伪造未知零值。
 
 ## 1. 官方来源
 
@@ -160,18 +166,38 @@ TypeSafe 的兼容响应示例
 
 需要严格完整 usage 的部署可由管理员配置 usage strict；客户端仍使用同一请求格式，不选择上游协议。compatible 下必须认识到省略必需明细及 `usage.decora` 是当前外部 schema 偏差，不能将未知值补 0 或宣称整个响应完全符合 OpenAI。
 
-## 4. 固定外部合同下的内部自动适配
+## 4. Hub-and-Spoke 多方言架构与入站映射
 
-### 请求与核心答案不因上游而变
+### 对称三阶段流水线
 
-所有公开 alias 都使用 OpenAI 的 model/input/questions 及 answers 数组；转换是网关职责，不是客户端需选择的协议。OpenAI 走原始结构分支，OpenRouter/TypeSafe 自动使用下述内部映射。没有输入转换策略、角色/JSON/typed choice 开关，合法且可映射的请求不会只因需要内部编码而 unsupported。
+```text
+  POST /v1/decisions       (OpenAI)     ──┐
+  POST /v1beta/decisions   (Gemini)     ──┼─► Dialect::parse_request ──► Canonical IR
+  POST /v0/decisions       (TypeSafe)   ──┤                                    │
+  POST /api/v1/decisions   (OpenRouter) ──┘                                    ▼
+                                                            Gateway::execute (路由 + Adapter)
+                                                                               │
+                                                                               ▼
+  返回对应方言响应 ◄── Dialect::format_response ◄────────── Canonical DecisionResponse
+```
 
+| 入站端点 | 方言 | 共享输入 | 题目容器与题型 | Refusal 与 Usage 处理 |
+|---|---|---|---|---|
+| `POST /v1/decisions` | `Dialect::Openai` | 字符串或角色消息数组（支持 `input_text/input_image/input_json`） | 数组 `questions[]`（`predicate / choice / score`） | 保留逐题 `refusal`；OpenAI 后端无 `usage.decora` |
+| `POST /v1beta/decisions` | `Dialect::Gemini` | 字符串或 `text / inline_data` 内容数组（归一化为 `user` 消息） | 对象 `questions{}`，键为 `1..=64` ASCII `[A-Za-z0-9_-]`（`noul / choice / score`）；`choice` 键须为 `1..=128` 无首尾空白 ASCII | 遇到上游逐题 `refusal` 报 `502 upstream_refusal_unrepresentable`；输出 `total_input_tokens / total_output_tokens / total_tokens` 与可选 `input_tokens_by_modality` + `usage.decora`（OpenAI 后端标记 `provider: openai`） |
+| `POST /v0/decisions` | `Dialect::Typesafe` | 字符串 `state` | 对象 `questions{}`，键为非空字符串（`noul / choice / score`）；`choice` 支持中文键与 `null` 描述；`score` 支持带 `description` 对象 | 遇到上游逐题 `refusal` 报 `502 upstream_refusal_unrepresentable`；`score.legend` 精确还原原 `criteria`；输出 `input_tokens / output_tokens / total_tokens` + `usage.decora` |
+| `POST /api/v1/decisions` | `Dialect::Openrouter` | 字符串 `state` | 同 TypeSafe 方言 | 同 TypeSafe 方言 |
+
+### 外部合同不变量与内部适配
+
+所有公开 alias 均在四个端点共享，转换是网关内部职责，没有客户端格式或转换策略开关。OpenAI 后端走原始结构分支，Gemini/OpenRouter/TypeSafe 后端通过 `adapter` 自动适配。
+
+- 入站方言严格边界：向 `/v1/decisions` 发送 `state` 或对象 `questions`、向 `/v1beta/decisions` 发送 `state` 或数组 `questions`、向 `/v0/decisions` 或 `/api/v1/decisions` 发送 `input` 或数组 `questions` 一律返回 `400 invalid_request`。
 - 消息数组按官方 OpenAI 已验证 schema 接收，角色仅为 system/developer/user/assistant，保留原顺序、标签、phase 及 content 的字符串/数组形态。不会添加自定义角色，也不擅加 Decisions 不支持的 name 等消息字段。
 - 字符串内容，包括空字符串，原样保留；内容数组中的 input_text/output_text/refusal 及 input_json.data 作为数据完整编码。允许空消息数组、空 content 数组、Unicode 与嵌套 JSON；仍受原请求的长度/JSON 深度等限制。
 - instructions 是字符串时原样使用；是 text/JSON 内容数组时自动内部编码。predicate/choice/score 共用此规则，题内 JSON 不丢失。
 - 布尔/字符串混合 choice 自动可逆映射；返回 choice 与概率 value 保持原始 OpenAI 类型，不把内部选项 ID 当作答案。
 - 图片、题型、题数、缓存及安全标识等真实能力仍筛选；usage 管理要求仍是独立的现存服务端选项。
-- 客户端发送上游 state/命名 questions 或转换控制字段会被当作非法请求，不构成另一套 API。
 
 ### 明确的编码与语义边界
 

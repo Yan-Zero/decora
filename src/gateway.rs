@@ -2,6 +2,7 @@
 use crate::{
     adapter::{compatible, native_body_for, native_response},
     config::{Backend, BackendKind, Config, resolve_secret},
+    dialect::Dialect,
     error::ApiError,
     protocol::{DecisionRequest, DecisionResponse},
 };
@@ -89,10 +90,33 @@ impl Gateway {
             }),
         })
     }
-    /// 构造仅含 Decisions 和最小健康检查的 Router；鉴权发生在 body 读取之前。
+    /// 构造支持多方言 Decisions 入口和最小健康检查的 Router；鉴权发生在 body 读取之前。
     pub fn router(&self) -> Router {
         let decisions = Router::new()
-            .route("/v1/decisions", post(create))
+            .route(
+                "/v1/decisions",
+                post(|state, headers, deadline, body| {
+                    create(Dialect::Openai, state, headers, deadline, body)
+                }),
+            )
+            .route(
+                "/v1beta/decisions",
+                post(|state, headers, deadline, body| {
+                    create(Dialect::Gemini, state, headers, deadline, body)
+                }),
+            )
+            .route(
+                "/v0/decisions",
+                post(|state, headers, deadline, body| {
+                    create(Dialect::Typesafe, state, headers, deadline, body)
+                }),
+            )
+            .route(
+                "/api/v1/decisions",
+                post(|state, headers, deadline, body| {
+                    create(Dialect::Openrouter, state, headers, deadline, body)
+                }),
+            )
             .route_layer(middleware::from_fn_with_state(self.clone(), guard));
         Router::new()
             .merge(decisions)
@@ -365,31 +389,38 @@ pub fn retry_after(value: Option<&str>, now: SystemTime) -> Option<u64> {
             .saturating_add(u64::from(duration.subsec_nanos() != 0)),
     )
 }
+fn valid_client_key(headers: &HeaderMap, expected: &str) -> bool {
+    let auth_count = headers.get_all(header::AUTHORIZATION).iter().count();
+    let goog_count = headers.get_all("x-goog-api-key").iter().count();
+    let provided = match (auth_count, goog_count) {
+        (1, 0) => headers
+            .get(header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer ")),
+        (0, 1) => headers.get("x-goog-api-key").and_then(|h| h.to_str().ok()),
+        _ => None,
+    };
+    provided.is_some_and(|v| bool::from(v.as_bytes().ct_eq(expected.as_bytes())))
+}
+
 async fn guard(
     State(state): State<Gateway>,
     mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if let Some(key) = &state.inner.bearer {
-        let headers = request.headers();
-        let provided = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
-        if headers.get_all(header::AUTHORIZATION).iter().count() != 1
-            || !provided.is_some_and(|v| bool::from(v.as_bytes().ct_eq(key.as_bytes())))
-        {
-            let mut response = ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "invalid_api_key",
-                "需要有效的 Bearer 凭据。",
-            )
-            .into_response();
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
-            return response;
-        }
+    if let Some(key) = &state.inner.bearer
+        && !valid_client_key(request.headers(), key)
+    {
+        let mut response = ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "需要有效的 Bearer 或 x-goog-api-key 凭据。",
+        )
+        .into_response();
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+        return response;
     }
     let Ok(_permit) = state.inner.slots.clone().try_acquire_owned() else {
         return ApiError::new(
@@ -413,11 +444,12 @@ async fn guard(
     }
 }
 async fn create(
+    dialect: Dialect,
     State(state): State<Gateway>,
     headers: HeaderMap,
     Extension(deadline): Extension<Deadline>,
     body: Result<Bytes, BytesRejection>,
-) -> Result<Json<DecisionResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     if headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -434,8 +466,9 @@ async fn create(
     let bytes =
         body.map_err(|e| ApiError::new(e.status(), "invalid_body", "请求体超过限制或读取失败。"))?;
     let value = serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid())?;
-    let (request, need) = DecisionRequest::parse(value, state.inner.config.max_images)?;
-    state.execute(request, need, deadline).await.map(Json)
+    let (request, need) = dialect.parse_request(value, state.inner.config.max_images)?;
+    let response = state.execute(request.clone(), need, deadline).await?;
+    dialect.format_response(&request, response).map(Json)
 }
 
 #[cfg(test)]

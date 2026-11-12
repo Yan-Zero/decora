@@ -495,6 +495,7 @@ pub struct OutputTokensDetails {
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageProvider {
+    Openai,
     Openrouter,
     Typesafe,
     Gemini,
@@ -503,6 +504,7 @@ pub enum UsageProvider {
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InputTokenBasis {
+    OpenaiInputTokens,
     ProviderReported,
     BillableInput,
     TotalInputTokens,
@@ -511,6 +513,7 @@ pub enum InputTokenBasis {
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TotalTokenBasis {
+    OpenaiInputPlusOutput,
     ProviderInputPlusOutput,
     BillableInputPlusOutput,
     TotalInputPlusOutput,
@@ -585,6 +588,10 @@ impl Usage {
             let consistent = matches!(
                 (&m.provider, &m.input_tokens_basis, &m.total_tokens_basis),
                 (
+                    UsageProvider::Openai,
+                    InputTokenBasis::OpenaiInputTokens,
+                    TotalTokenBasis::OpenaiInputPlusOutput
+                ) | (
                     UsageProvider::Typesafe,
                     InputTokenBasis::BillableInput,
                     TotalTokenBasis::BillableInputPlusOutput
