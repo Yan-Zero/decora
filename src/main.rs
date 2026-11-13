@@ -15,11 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.yaml"));
     if args.next().is_some() {
-        return Err("用法：decora [config.yaml]".into());
+        return Err("usage: decora [config.yaml]".into());
     }
     let gateway = Gateway::new(Config::load(&path)?)?;
     let listener = tokio::net::TcpListener::bind(gateway.listen()).await?;
-    tracing::info!("Decora 已启动；健康检查不代表上游可用");
+    tracing::info!("Decora started; /healthz does not imply upstreams are reachable");
     axum::serve(listener, gateway.router())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

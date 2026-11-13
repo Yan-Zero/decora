@@ -131,23 +131,24 @@ pub struct Config {
 impl Config {
     /// 读取 YAML；错误不包含文件内容或可能的凭据。
     pub fn load(path: &Path) -> Result<Self, String> {
-        let content = std::fs::read_to_string(path).map_err(|_| "无法读取配置文件".to_owned())?;
+        let content =
+            std::fs::read_to_string(path).map_err(|_| "cannot read the config file".to_owned())?;
         Self::from_yaml(&content)
     }
     /// 解析和验证 YAML（支持 api_key_env/bearer_key_env，禁止内联密钥）。
     pub fn from_yaml(content: &str) -> Result<Self, String> {
-        let cfg: Self =
-            serde_saphyr::from_str(content).map_err(|_| "配置 YAML 字段或类型错误".to_owned())?;
+        let cfg: Self = serde_saphyr::from_str(content)
+            .map_err(|_| "config YAML has invalid fields or types".to_owned())?;
         cfg.validate()?;
         Ok(cfg)
     }
     /// 拒绝无界重试、明文远端凭据、无鉴权公网监听和无效候选。
     pub fn validate(&self) -> Result<(), String> {
-        let bad = || "配置范围、能力或路由无效".to_owned();
+        let bad = || "config has an invalid range, capability or route".to_owned();
         if !self.listen.ip().is_loopback()
             && (!self.allow_public_bind || self.bearer_key_env.is_none())
         {
-            return Err("非 loopback 监听需要 allow_public_bind 和 bearer_key_env".into());
+            return Err("non-loopback listen requires allow_public_bind and bearer_key_env".into());
         }
         if !(1..=16).contains(&self.max_attempts)
             || !(1..=360_000).contains(&self.attempt_timeout_ms)
@@ -193,7 +194,7 @@ impl Config {
                 || url.query().is_some()
                 || url.fragment().is_some()
             {
-                return Err("端点必须为 HTTPS 且不含用户信息、查询参数或片段；HTTP 只允许显式启用的 loopback IP".into());
+                return Err("endpoints must be HTTPS without userinfo, query or fragment; HTTP is only allowed for explicitly enabled loopback IPs".into());
             }
         }
         for (alias, ids) in &self.models {
@@ -218,7 +219,7 @@ fn check_env_name(name: &str) -> Result<(), String> {
             .enumerate()
             .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
     {
-        return Err("凭据环境变量名称无效".into());
+        return Err("invalid credential environment variable name".into());
     }
     Ok(())
 }
@@ -227,9 +228,9 @@ pub fn resolve_secret(
     name: &str,
     lookup: &impl Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
-    let value = lookup(name).ok_or_else(|| "缺少凭据环境变量".to_owned())?;
+    let value = lookup(name).ok_or_else(|| "missing credential environment variable".to_owned())?;
     if value.is_empty() || value.len() > 8192 || value.bytes().any(|b| b <= 32 || b >= 127) {
-        return Err("凭据必须是非空可打印 ASCII 且不含空白".into());
+        return Err("credentials must be non-empty printable ASCII without whitespace".into());
     }
     Ok(value)
 }

@@ -29,7 +29,7 @@ impl ApiError {
         Self::new(
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "请求字段、类型或范围不符合 Decisions 协议。",
+            "Request fields, types or ranges do not match the Decisions protocol.",
         )
     }
     /// 协议存在该能力，但当前网关或候选不能无损支持。
@@ -37,7 +37,7 @@ impl ApiError {
         Self::new(
             StatusCode::BAD_REQUEST,
             code,
-            "当前候选无法无损支持该请求；请查看能力矩阵。",
+            "No configured upstream can serve this request losslessly; see the capability matrix.",
         )
     }
     /// 上游响应违反合同；不重试或切换模型。
@@ -45,7 +45,7 @@ impl ApiError {
         Self::new(
             StatusCode::BAD_GATEWAY,
             "upstream_protocol_error",
-            "上游响应不符合已核实的协议。",
+            "Upstream response violated the verified protocol.",
         )
     }
 }

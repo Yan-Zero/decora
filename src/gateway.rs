@@ -78,7 +78,7 @@ impl Gateway {
             .pool_max_idle_per_host(16)
             .user_agent("Decora/0.1")
             .build()
-            .map_err(|_| "HTTP TLS 客户端初始化失败".to_owned())?;
+            .map_err(|_| "failed to initialise the HTTP TLS client".to_owned())?;
         let slots = Arc::new(Semaphore::new(config.max_in_flight));
         Ok(Self {
             inner: Arc::new(Inner {
@@ -122,7 +122,7 @@ impl Gateway {
             .merge(decisions)
             .route("/healthz", get(|| async { Json(json!({"status": "ok"})) }))
             .fallback(|| async {
-                ApiError::new(StatusCode::NOT_FOUND, "not_found", "接口不存在。")
+                ApiError::new(StatusCode::NOT_FOUND, "not_found", "Endpoint not found.")
             })
             .layer(DefaultBodyLimit::max(self.inner.config.max_body_bytes))
             .with_state(self.clone())
@@ -148,7 +148,7 @@ impl Gateway {
                 ApiError::new(
                     StatusCode::NOT_FOUND,
                     "model_not_found",
-                    "公开模型 alias 不存在。",
+                    "Unknown public model alias.",
                 )
             })?;
         let mut compatible_ids = Vec::new();
@@ -182,7 +182,7 @@ impl Gateway {
         let mut last = ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unavailable",
-            "兼容上游暂时不可用。",
+            "No compatible upstream is available right now.",
         );
         for attempt in 0..self.inner.config.max_attempts {
             let Some(remaining) = deadline.0.checked_duration_since(Instant::now()) else {
@@ -240,7 +240,7 @@ impl Gateway {
                                     return Err(ApiError::new(
                                         StatusCode::BAD_GATEWAY,
                                         "upstream_body_error",
-                                        "上游响应体传输失败；未自动重放请求。",
+                                        "Upstream response body transfer failed; the request was not replayed.",
                                     ));
                                 }
                             }
@@ -274,7 +274,7 @@ impl Gateway {
                         last = ApiError::new(
                             StatusCode::TOO_MANY_REQUESTS,
                             "rate_limit_exceeded",
-                            "兼容上游限流，请稍后重试。",
+                            "Compatible upstreams are rate limited; retry later.",
                         );
                         last.retry_after = Some(seconds);
                         wait = Duration::from_secs(seconds);
@@ -282,7 +282,7 @@ impl Gateway {
                         last = ApiError::new(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "upstream_unavailable",
-                            "兼容上游暂时不可用。",
+                            "No compatible upstream is available right now.",
                         );
                         wait = backoff(attempt);
                     } else if status.is_client_error() {
@@ -294,13 +294,13 @@ impl Gateway {
                                 StatusCode::BAD_REQUEST
                             },
                             "upstream_client_error",
-                            "上游拒绝请求；未切换模型，请检查协议或服务端配置。",
+                            "Upstream rejected the request; no fallback was attempted. Check the protocol or server configuration.",
                         ));
                     } else {
                         return Err(ApiError::new(
                             StatusCode::BAD_GATEWAY,
                             "upstream_http_error",
-                            "上游返回不支持的 HTTP 状态；重定向已禁用。",
+                            "Upstream returned an unsupported HTTP status; redirects are disabled.",
                         ));
                     }
                 }
@@ -311,7 +311,7 @@ impl Gateway {
                         ApiError::new(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "upstream_unavailable",
-                            "兼容上游连接失败。",
+                            "Could not connect to a compatible upstream.",
                         )
                     };
                     wait = backoff(attempt);
@@ -320,14 +320,14 @@ impl Gateway {
                     return Err(ApiError::new(
                         StatusCode::BAD_GATEWAY,
                         "upstream_transport_error",
-                        "上游传输失败；未自动重放请求。",
+                        "Upstream transfer failed; the request was not replayed.",
                     ));
                 }
             }
             tracing::warn!(
                 attempt = attempt + 1,
                 error_code = last.code,
-                "上游暂时失败"
+                "upstream temporarily failed"
             );
             if attempt + 1 == self.inner.config.max_attempts {
                 break;
@@ -347,7 +347,7 @@ fn timeout_error() -> ApiError {
     ApiError::new(
         StatusCode::GATEWAY_TIMEOUT,
         "upstream_timeout",
-        "请求超过网关时间预算。",
+        "Request exceeded the gateway time budget.",
     )
 }
 fn weighted_order<'a>(
@@ -426,7 +426,7 @@ async fn guard(
         let mut response = ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_api_key",
-            "需要有效的 Bearer 或 x-goog-api-key 凭据。",
+            "A valid Bearer or x-goog-api-key credential is required.",
         )
         .into_response();
         response
@@ -438,7 +438,7 @@ async fn guard(
         return ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "gateway_busy",
-            "网关并发已满，请稍后重试。",
+            "Gateway is at its concurrency limit; retry later.",
         )
         .into_response();
     };
@@ -472,11 +472,16 @@ async fn create(
         return Err(ApiError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "invalid_content_type",
-            "请求必须使用 application/json。",
+            "Request must use application/json.",
         ));
     }
-    let bytes =
-        body.map_err(|e| ApiError::new(e.status(), "invalid_body", "请求体超过限制或读取失败。"))?;
+    let bytes = body.map_err(|e| {
+        ApiError::new(
+            e.status(),
+            "invalid_body",
+            "Request body exceeded the limit or could not be read.",
+        )
+    })?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid())?;
     let (request, need) = dialect.parse_request(value.clone(), state.inner.config.max_images)?;
     state

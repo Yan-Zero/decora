@@ -577,7 +577,7 @@ impl Dialect {
                     return Err(ApiError::new(
                         StatusCode::BAD_GATEWAY,
                         "upstream_refusal_unrepresentable",
-                        "当前入口协议不支持逐题 refusal 表达；未伪造概率。",
+                        "This dialect cannot express a per-question refusal; no probabilities were fabricated.",
                     ));
                 }
                 (Answer::Predicate { probability, .. }, Question::Predicate { .. }) => {
