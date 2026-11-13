@@ -60,8 +60,8 @@ curl http://127.0.0.1:8787/v1/decisions \
 
 以下是**服务端 config.yaml 管理选项**，不是请求参数。本轮没有把兼容 usage 规范化为严格 OpenAI schema：省略必需明细和增加 `usage.decora` 都是已知差异，不能据此声称整个响应完全一致。
 
-- `compatible`（默认）：四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）都可参与路由。原生 OpenAI 仍严格校验它本来就提供的完整 usage；Gemini/OpenRouter/Jev 保留已知计数和存在的明细，未知字段省略。
-- `strict`：要求完整精确的 OpenAI usage，Gemini/OpenRouter/Jev 在发请求前返回 `unsupported_usage` 或被其他兼容候选替代。
+- `compatible`（默认）：四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）都可参与路由。原生 OpenAI 仍严格校验它本来就提供的完整 usage；同方言直通（如 `/v1beta/decisions -> gemini`、`/v0/decisions -> typesafe`、`/api/v1/decisions -> openrouter`）原样返回原生 `usage` 且**不注入 `usage.decora`**；跨方言路由时保留已知计数与明细并添加 `usage.decora` 标记，未知字段省略。
+- `strict`：要求完整精确的目标方言 usage。**同方言原生直通候选**（如 `/v1/decisions -> openai`、`/v1beta/decisions -> gemini`、`/v0/decisions -> typesafe`、`/api/v1/decisions -> openrouter`）正常放行并原样返回；跨方言的非 OpenAI 候选在发请求前返回 `unsupported_usage` 或被其他兼容候选替代。
 
 例如 TypeSafe 响应可包含如下 usage（合同示例，不是真实调用记录）。这里的 132 **只是计费输入与输出之和**，不是经验证的 OpenAI 总 token 量。
 
@@ -100,10 +100,12 @@ Google Gemini 原生响应不提供细分缓存/推理 token（`total_output_tok
 
 OpenRouter 使用 `provider_reported / provider_input_plus_output` 标记；若上游提供 `cached_tokens`，则保留该明细而不补 `cache_write_tokens`。上游 cost 存在时保留为 `usage.decora.provider_cost`。需要精确 OpenAI usage schema 的部署可由管理员配置 strict；客户端不应将省略值解释为 0。
 
-### 网关内部的角色、JSON 与有类型选项转换
+### 同方言原生直通与跨方言自动转换
 
-**客户端始终发送标准 Decisions 请求；下面仅说明内部实现，不是额外 API、请求选项或调用前置要求。** 对合法且已可映射的角色、JSON 和 typed choice，不会再因为需要内部编码而拒绝。
+**客户端始终按所选端点发送对应原生 Decisions 请求；下面说明内部路由策略，无需客户端切换开关。**
 
+- **同方言原生直通（Same-Dialect Passthrough）**：当入站端点方言与当前尝试的目标后端 `kind` 同构时（`OpenAI↔OpenAI`、`Gemini↔Gemini`、`TypeSafe↔TypeSafe`、`OpenRouter↔OpenRouter`），网关仅替换顶层 `model` 为后端配置模型并保留原始 `questions` 键名、选项键名与 `criteria`；收到上游响应后仍执行完整的概率分布、最大概率选项、`score.legend`、加权期望及 token 守恒校验，随后原样返回原生响应（仅将顶层 `model` 写回公开 alias，**不注入 `usage.decora`**，完整保留原生 `cost` / `input_tokens_by_modality` 等字段）。
+- **异构跨方言自动转换与回退**：当路由跨越多家协议或同方言主后端返回 429/5xx/超时并回退至异构备用后端时，网关自动切换为通过 Canonical IR 转换。
 - OpenAI adapter 保留原始 input/questions 结构。
 - Gemini 使用顶层 `input` 承载共享输入（字符串原样传递；角色消息数组自动文本编码为字符串）；鉴权使用 `x-goog-api-key` 请求头。题目使用内部 ASCII 选项键与紧凑 JSON criteria 字符串无损支持中文/布尔 choice；score criteria 映射为有序非空字符串数组。
 - OpenRouter/Jev 的字符串 input 原样转换；消息数组自动编码为有边界的 JSON 文本，放在官方允许的内部 state 中，保留四种合法角色、顺序、phase、空内容、Unicode 和嵌套 JSON。
@@ -217,7 +219,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-2026-11-13 实际结果：**42 项测试通过**（1 项单测 + 41 项离线集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查无漏洞（仅 1 项已允许的 yanked 维护提醒）。详细过程见 `HANDOFF.md`。
+2026-11-13 实际结果：**43 项测试通过**（1 项单测 + 42 项离线集成测试），以上四项检查均通过；额外 `cargo audit` 对 182 个锁定依赖的检查无漏洞（仅 1 项已允许的 yanked 维护提醒）。详细过程见 `HANDOFF.md`。
 
 测试只访问随机端口的 loopback mock，不读取真实 key、不访问付费 API。包含真实入站 TCP 请求、四类入站端点（`/v1/decisions`、`/v1beta/decisions`、`/v0/decisions`、`/api/v1/decisions`）与四类上游（OpenAI、Gemini、OpenRouter、TypeSafe）的三题型 HTTP 往返、Gemini `inline_data` 图片数组入站路由至 OpenAI 视觉后端、所有后端 alias 使用相同 OpenAI 请求和核心 answers 的回归、方言 Schema 越界与上游专有请求形状拒绝、Gemini/OpenRouter→TypeSafe/OpenAI 实际协议回退、非 OpenAI 入站遇到 OpenAI 逐题 `refusal` 返回 `502 upstream_refusal_unrepresentable`、服务端 usage compatible/strict 选项、Gemini `total_input_tokens` 与 TypeSafe `billable_input` 标记、未知 usage 明细省略、概率/usage 校验、四种角色与题内 JSON 的文本往返、Unicode/空内容/转义边界、true/false 与同名字符串及内部键碰撞、实际图片独立筛选、重复名称、鉴权（Bearer 与 x-goog-api-key 及双头冲突拒绝）、路由与加权排序、兼容候选回退、重定向拦截、429、慢速上传后的共享重试预算、超时、并发及双向 body 限制。
 

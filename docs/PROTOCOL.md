@@ -150,7 +150,7 @@ TypeSafe 的兼容响应示例
 
 ### 服务端管理选项 usage_policy: strict（可选）
 
-要求完整 OpenAI usage 与计数口径，不添加兼容扩展。由于官方合同缺少明细或 input 语义不同，运行时在网络调用前排除 Gemini/OpenRouter/TypeSafe；若 alias 只剩这些候选，返回 `400 unsupported_usage`。若有兼容 OpenAI 候选则继续路由它。默认 compatible 和 strict 使用完全相同的概率、confidence、评分期望、拒答和重试规则。
+要求完整目标方言 usage 与计数口径。**同方言原生直通候选**（`Openai↔Openai`、`Gemini↔Gemini`、`Typesafe↔Typesafe`、`Openrouter↔Openrouter`）因直接返回调用方期望的完整原生 usage 而正常放行；跨方言的非 OpenAI 候选在网络调用前被排除（若某路由仅剩异构非完整 usage 候选，返回 `400 unsupported_usage`）。默认 compatible 和 strict 使用完全相同的概率、confidence、评分期望、拒答和重试规则。
 
 ### 原生 HTTP 转换范围
 
@@ -168,18 +168,19 @@ TypeSafe 的兼容响应示例
 
 ## 4. Hub-and-Spoke 多方言架构与入站映射
 
-### 对称三阶段流水线
+### 对称三阶段流水线（含同方言直通分支）
 
 ```text
   POST /v1/decisions       (OpenAI)     ──┐
   POST /v1beta/decisions   (Gemini)     ──┼─► Dialect::parse_request ──► Canonical IR
   POST /v0/decisions       (TypeSafe)   ──┤                                    │
   POST /api/v1/decisions   (OpenRouter) ──┘                                    ▼
-                                                            Gateway::execute (路由 + Adapter)
-                                                                               │
-                                                                               ▼
-  返回对应方言响应 ◄── Dialect::format_response ◄────────── Canonical DecisionResponse
+                                                            Gateway::execute (per-attempt 路由)
+                                                                ├─ 同方言直通: Dialect::passthrough_body/response (不改写键名，不注入 decora)
+                                                                └─ 异构跨方言: Adapter + Dialect::format_response
 ```
+
+- **同方言原生直通（Same-Dialect Passthrough）**：按单次尝试（per-attempt）的目标后端动态判断。若 `dialect.matches_backend(backend.kind)` 为真，请求直接克隆原始 JSON 并仅替换顶层 `model`，保留原始 `questions` 键名、选项键名与 `criteria`；响应经严格的分布和、最大概率、加权期望、`legend` 一致性及 token 守恒校验后原样返回（不注入 `usage.decora`，保留原生 `cost` / `input_tokens_by_modality` 等字段）。若主后端 503/429 回退至异构备用后端，下一次尝试自动切换为跨方言 Canonical IR 转换。
 
 | 入站端点 | 方言 | 共享输入 | 题目容器与题型 | Refusal 与 Usage 处理 |
 |---|---|---|---|---|

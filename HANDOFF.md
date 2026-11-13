@@ -1,31 +1,27 @@
 # Decora 开发接续记录
 
-## 当前结论：对称中心辐射式（Hub-and-Spoke）多方言架构与四端点全通
-**Decora 现已支持多前端方言（OpenAI、Gemini、TypeSafe、OpenRouter）通过内部标准中间表示（Canonical Decision IR）跨任意兼容上游路由与故障回退。42 项测试通过（1 项单测 + 41 项离线集成测试），fmt/check/clippy/audit 全通过。**
+## 当前结论：同方言原生直通（Same-Dialect Passthrough）与异构自动转换协同全通
+**Decora 现已在对称中心辐射式（Hub-and-Spoke）多方言架构上支持“按单次尝试动态选择同方言原生直通或异构跨方言自动转换”。43 项测试通过（1 项单测 + 42 项离线集成测试），fmt/check/clippy/audit 全通过。**
 
-**尚未完全符合原生 schema 的明确例外：usage compatible 仍允许省略目标方言或 OpenAI 未知的必需明细并增加 `usage.decora`。** 本轮完整保留该服务端管理行为，不伪造未知零值，不将整个响应描述为严格完全一致。
+**尚未完全符合原生 schema 的明确例外：跨方言路由在 `usage_policy: compatible` 下仍允许省略目标方言或 OpenAI 未知的必需明细并增加 `usage.decora`。** 同方言原生直通则原样返回上游原生 `usage`（不注入 `usage.decora`），且在 `usage_policy: strict` 下正常放行。
 
 ## 本轮任务与 Git 起点
-- 任务：完成 `.kiro/specs/multi-dialect-endpoints/` 规范全部 6 项任务，构建 **“多前端方言（Dialect） ↔ 内部标准中间表示（Canonical Decision IR） ↔ 多后端适配器（Adapter）”** 架构，原生挂载四类官方入站端点与双轨入站鉴权。
+- 任务：完成 `.kiro/specs/dialect-passthrough/` 规范全部 5 项任务，实现 `OpenAI↔OpenAI`、`Gemini↔Gemini`、`TypeSafe↔TypeSafe`、`OpenRouter↔OpenRouter` 同方言原生直通及跨方言自动回退。
 - 路径 `E:\source\toy\decora`；分支 `feat/decisions-gateway`。只本地修改、测试与提交，不推送、不访问付费 API。
 
-## 本轮多方言架构与核心实现
+## 本轮同方言直通核心实现
 
-### 1. 对称中心辐射式重构（`src/dialect.rs` + `src/adapter.rs` + `src/protocol.rs`）
-- **`src/dialect.rs`（新增）**：定义 `Dialect::{Openai, Gemini, Typesafe, Openrouter}`，提供 `parse_request`（入站严格校验并归一化至 Canonical `DecisionRequest`）与 `format_response`（出站按入站方言重排并格式化）。
-  - Gemini `input` 支持纯文本与 `[{"text": ...}, {"inline_data": {"mime_type": ..., "data": ...}}]` 多模态数组，归一化为标准 `input_text` / `input_image` 交由统一校验器执行 base64、MIME 与图片数量上限拦截。
-  - 若非 OpenAI 入站端点（Gemini、TypeSafe、OpenRouter）收到 OpenAI 上游返回的逐题 `Answer::Refusal`，明确返回 `502 upstream_refusal_unrepresentable`，绝不伪造 `0.0` 或触发跨模型回退。
-- **`src/protocol.rs`**：`UsageProvider` 新增 `Openai`、`InputTokenBasis` 新增 `OpenaiInputTokens`、`TotalTokenBasis` 新增 `OpenaiInputPlusOutput`，用于非 OpenAI 入站端点路由至 OpenAI 后端时的透明来源标记。
-- **`src/adapter.rs`**：提取 `choice_key_for`、`score_criterion` 与 `non_negative_i32`，消除 `native_answers_for` 重新构建整份 `native_body_for` 的冗余开销及重复解析闭包。
+### 1. 同构匹配与按尝试（Per-Attempt）动态切换（`src/dialect.rs` + `src/gateway.rs`）
+- `Dialect::matches_backend(kind)` 定义四类同构配对：`Openai↔Openai`、`Gemini↔Gemini`、`Typesafe↔Typesafe`、`Openrouter↔Openrouter`。
+- `Dialect::passthrough_body`：在同方言直通模式下直接克隆已通过入站校验的原始请求 JSON，仅将顶层 `model` 替换为 `backend.model`，完整保留客户端原始 `questions` 键名、选项键名与 `criteria`（不再重写为 `q0/q1` 或 `decora_choice_0`）。
+- `Gateway::execute`：在每次 `attempt` 循环中动态判断 `dialect.matches_backend(backend.config.kind)`；若同方言主后端因 429/5xx/超时回退至异构备用后端，下一次尝试自动切换为跨方言 Canonical IR 转换（`native_body_for` / `format_response`）。
 
-### 2. 四方言入站端点与双轨入站鉴权（`src/gateway.rs`）
-- 挂载四个独立端点：
-  - `POST /v1/decisions` -> `Dialect::Openai`
-  - `POST /v1beta/decisions` -> `Dialect::Gemini`
-  - `POST /v0/decisions` -> `Dialect::Typesafe`
-  - `POST /api/v1/decisions` -> `Dialect::Openrouter`
-- 严格方言边界：禁止在同一路径上混用其他方言字段（如向 `/v1/decisions` 发 `state`、向 `/v1beta/decisions` 发 `state` 或数组 `questions`、向 `/v0/decisions` 发 `input` 或数组 `questions`），一律返回 `400 invalid_request`。
-- 双轨入站鉴权：在 `guard` 中支持单一定长比较（`ConstantTimeEq`）的 `Authorization: Bearer <key>` 或 `x-goog-api-key: <key>`；若同时携带两种头、重复同名头或凭据无效，在读取请求体前立即返回 `401 invalid_api_key`（附 `WWW-Authenticate: Bearer`），且绝不向上游转发客户端入站凭据。
+### 2. 直通响应的严格校验与零污染透传（`src/dialect.rs`）
+- `Dialect::passthrough_response`：复用了 `DecisionResponse::parse_with_usage` 与原生 `usage` 校验逻辑，严格检查概率有限 `[0, 1]`、分布和与 `score` 加权期望容差 `<= 0.0001`、`choice` 最大概率选中项、`score.legend == raw_request["questions"][key]["criteria"][i]` 以及 token 加和守恒。
+- 校验通过后仅将顶层 `model` 还原为公开 `model` alias，原样返回原生 `answers` 与 `usage`（**不注入 `usage.decora`**，完整保留 OpenRouter `usage.cost` 与 Gemini `input_tokens_by_modality`）。
+
+### 3. `usage_policy: strict` 放行同方言候选（`src/adapter.rs`）
+- `compatible_for_dialect` 在 `usage_policy: strict` 下放行同方言原生候选（例如 `/v1beta/decisions -> gemini`、`/v0/decisions -> typesafe`、`/api/v1/decisions -> openrouter`），同时继续在网络调用前拦截跨方言非 OpenAI 候选（返回 `400 unsupported_usage`）与真实 `input_image`（非 OpenAI 原生后端返回 `400 unsupported_native_images`）。
 
 ## 验证结果（2026-11-13）
 按顺序串行执行：
@@ -33,22 +29,19 @@
 | 检查 | 实际结果 |
 |---|---|
 | cargo fmt --check | 通过，无格式差异 |
-| cargo check --locked | 通过 |
-| cargo test --locked | 1 项单测 + 41 项离线集成测试，共 42 项通过、0 失败；集成测试 0.83 秒 |
-| cargo clippy --locked --all-targets -- -D warnings | 通过，无警告 |
+| cargo check --locked | 通过（1.00 秒） |
+| cargo test --locked | 1 项单测 + 42 项离线集成测试，共 43 项通过、0 失败；集成测试 0.84 秒 |
+| cargo clippy --locked --all-targets -- -D warnings | 通过，无警告（2.60 秒） |
 | cargo audit --file Cargo.lock | 182 个锁定依赖，1490 条公告库，0 漏洞，1 项 yanked 警告允许 |
 
-新增 4 项多方言离线集成测试重点：
-- `multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai`：Gemini `/v1beta/decisions` 使用 `x-goog-api-key` 鉴权往返三题型、Gemini 503 回退 OpenAI（校验 `usage.decora.provider == "openai"` 与 Gemini usage 口径）、Gemini `inline_data` 图片数组路由至 OpenAI 视觉后端并拦截纯文本非视觉后端（`400 unsupported_native_images`）。
-- `multi_dialect_typesafe_and_openrouter_inbound_with_chinese_and_score_descriptions`：TypeSafe `/v0/decisions` 与 OpenRouter `/api/v1/decisions` 发送含中文选项（`"售后"`）及带 `description` 的 `score.criteria`，路由至 Gemini/OpenAI 后端并精准还原 `answers` 与 `score.legend`。
-- `strict_dialect_boundaries_and_dual_auth_conflict_rejections`：跨方言字段混用均返回 `400 invalid_request` 且不触达上游；同时发送 `Authorization` 与 `x-goog-api-key` 或重复头均返回 `401 invalid_api_key`。
-- `non_openai_dialect_returns_502_unrepresentable_on_openai_refusal_without_fallback`：`/v1beta/decisions`、`/v0/decisions`、`/api/v1/decisions` 遇到 OpenAI 逐题 `refusal` 时返回 `502 upstream_refusal_unrepresentable` 且不触发回退。
+新增与更新测试重点：
+- `multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai`：第 1 步验证 `Gemini -> Gemini` 同方言直通（保留原始键名 `"a_damaged"`、`"b_route"`、`"c_level"` 与 `"a_support"`、`"b_sales"`，无 `usage.decora`）；第 2 步验证 Gemini 503 自动回退至 OpenAI 后端并切换为跨方言转换（含 `usage.decora.provider == "openai"`）。
+- `same_dialect_passthrough_preserves_native_keys_and_works_under_strict_usage`：验证 `/v0/decisions -> typesafe`、`/api/v1/decisions -> openrouter`（保留原生 `usage.cost` 与中文键名，无 `usage.decora`）以及 `/v1beta/decisions -> gemini` 在 `usage_policy: strict` 下全部直通成功；同时验证跨方言非 OpenAI 路由在 `strict` 下仍返回 `400 unsupported_usage`，以及直通模式下非法概率、篡改 `legend` 与非法 `usage` 均被拦截为 `502 upstream_protocol_error` 且不回退。
 
 ## 文件与安全交付
-- `src/dialect.rs`、`src/lib.rs`：新增并导出多方言编解码层。
-- `src/protocol.rs`、`src/adapter.rs`、`src/gateway.rs`：支持 Hub-and-Spoke、四端点路由与双轨定长鉴权。
-- `tests/offline.rs`：新增 4 项多方言与跨协议边界集成测试（总数增至 42 项）。
-- `README.md`、`docs/PROTOCOL.md`、`.kiro/steering/`、`.kiro/specs/multi-dialect-endpoints/`：文档与 Spec 任务清单全部更新并勾选 `[x]`。
+- `src/adapter.rs`、`src/dialect.rs`、`src/gateway.rs`：同方言直通与异构回退切换逻辑。
+- `tests/offline.rs`：更新 Gemini 直通与跨方言回退测试，新增同方言直通与 `strict` 模式测试（总数增至 43 项）。
+- `README.md`、`docs/PROTOCOL.md`、`HANDOFF.md`、`.kiro/specs/dialect-passthrough/tasks.md`：文档与 Spec 清单全部同步更新并勾选 `[x]`。
 
 ## 后续仍需
 1. 主会话推送本轮本地提交。

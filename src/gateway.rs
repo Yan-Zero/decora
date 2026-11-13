@@ -1,6 +1,6 @@
 //! HTTP 服务、连接复用、带能力过滤的加权优先级路由和有界故障回退。
 use crate::{
-    adapter::{compatible, native_body_for, native_response},
+    adapter::{compatible_for_dialect, native_body_for, native_response},
     config::{Backend, BackendKind, Config, resolve_secret},
     dialect::Dialect,
     error::ApiError,
@@ -133,10 +133,12 @@ impl Gateway {
     }
     async fn execute(
         &self,
+        dialect: Dialect,
+        raw_request: Value,
         request: DecisionRequest,
         need: crate::protocol::Requirements,
         deadline: Deadline,
-    ) -> Result<DecisionResponse, ApiError> {
+    ) -> Result<Value, ApiError> {
         let ids = self
             .inner
             .config
@@ -153,7 +155,8 @@ impl Gateway {
         let mut usage_blocked = false;
         let mut incompatible_code = "unsupported_capability";
         for id in ids {
-            match compatible(
+            match compatible_for_dialect(
+                dialect,
                 &self.inner.backends[id].config,
                 &request,
                 &need,
@@ -186,9 +189,14 @@ impl Gateway {
                 return Err(timeout_error());
             };
             let backend = &self.inner.backends[order[attempt % order.len()]];
-            let body = match backend.config.kind {
-                BackendKind::Openai => request.openai_body(&backend.config.model),
-                kind => native_body_for(&request, &backend.config.model, kind)?,
+            let passthrough = dialect.matches_backend(backend.config.kind);
+            let body = if passthrough {
+                dialect.passthrough_body(&raw_request, &request, &backend.config.model)
+            } else {
+                match backend.config.kind {
+                    BackendKind::Openai => request.openai_body(&backend.config.model),
+                    kind => native_body_for(&request, &backend.config.model, kind)?,
+                }
             };
             let timeout =
                 Duration::from_millis(self.inner.config.attempt_timeout_ms).min(remaining);
@@ -239,16 +247,20 @@ impl Gateway {
                         }
                         let value: Value =
                             serde_json::from_slice(&bytes).map_err(|_| ApiError::protocol())?;
-                        return match backend.config.kind {
+                        if passthrough {
+                            return dialect.passthrough_response(&raw_request, &request, value);
+                        }
+                        let canonical = match backend.config.kind {
                             // OpenAI 官方本来就保证完整 usage；不把其缺项伪装成兼容模式。
-                            BackendKind::Openai => DecisionResponse::parse(value, &request),
+                            BackendKind::Openai => DecisionResponse::parse(value, &request)?,
                             kind => native_response(
                                 value,
                                 &request,
                                 kind,
                                 self.inner.config.usage_policy,
-                            ),
+                            )?,
                         };
+                        return dialect.format_response(&request, canonical);
                     }
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let seconds = retry_after(
@@ -465,10 +477,12 @@ async fn create(
     }
     let bytes =
         body.map_err(|e| ApiError::new(e.status(), "invalid_body", "请求体超过限制或读取失败。"))?;
-    let value = serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid())?;
-    let (request, need) = dialect.parse_request(value, state.inner.config.max_images)?;
-    let response = state.execute(request.clone(), need, deadline).await?;
-    dialect.format_response(&request, response).map(Json)
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid())?;
+    let (request, need) = dialect.parse_request(value.clone(), state.inner.config.max_images)?;
+    state
+        .execute(dialect, value, request, need, deadline)
+        .await
+        .map(Json)
 }
 
 #[cfg(test)]

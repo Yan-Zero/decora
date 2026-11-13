@@ -1786,17 +1786,17 @@ async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai(
         }
     });
 
-    // 1) 直连 Gemini 后端，使用 x-goog-api-key 入站鉴权
+    // 1) 直连 Gemini 后端（同方言原生直通），使用 x-goog-api-key 入站鉴权
     let gemini_upstream_resp = json!({
         "answers": {
-            "q0": {"type": "noul", "noul": 0.9},
-            "q1": {
+            "a_damaged": {"type": "noul", "noul": 0.9},
+            "b_route": {
                 "type": "choice",
-                "choice": "decora_choice_0",
+                "choice": "a_support",
                 "confidence": 0.8,
-                "probabilities": {"decora_choice_0": 0.85, "decora_choice_1": 0.15}
+                "probabilities": {"a_support": 0.85, "b_sales": 0.15}
             },
-            "q2": {
+            "c_level": {
                 "type": "score",
                 "score": 0.7,
                 "confidence": 0.6,
@@ -1845,11 +1845,18 @@ async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai(
         v["usage"]["input_tokens_by_modality"],
         json!([{"modality": "text", "tokens": 80}])
     );
-    assert_eq!(v["usage"]["decora"]["provider"], "gemini");
+    assert!(v["usage"].get("decora").is_none());
     {
         let seen = gemini_mock.state.seen.lock().unwrap();
         assert_eq!(seen[0].0["x-goog-api-key"], "sk-offline-upstream");
         assert_ne!(seen[0].0["x-goog-api-key"], "offline-client-key");
+        assert_eq!(seen[0].1["model"], "gemini-decision-1");
+        assert!(seen[0].1["questions"].get("a_damaged").is_some());
+        assert!(seen[0].1["questions"].get("q0").is_none());
+        assert_eq!(
+            seen[0].1["questions"]["b_route"]["criteria"],
+            json!({"a_support": "客服", "b_sales": ""})
+        );
     }
 
     // 2) Gemini 上游 503 回退至 OpenAI 后端，仍按 Gemini 响应格式返回且标明 provider: openai
@@ -2203,4 +2210,199 @@ async fn non_openai_dialect_returns_502_unrepresentable_on_openai_refusal_withou
         assert_eq!(oa.count(), 1);
         assert_eq!(fb.count(), 0);
     }
+}
+
+#[tokio::test]
+async fn same_dialect_passthrough_preserves_native_keys_and_works_under_strict_usage() {
+    let ts_or_request = json!({
+        "model": "decora-test",
+        "state": "包裹外壳破损，要求退换货。",
+        "questions": {
+            "route_team": {
+                "type": "choice",
+                "instructions": "分给哪个部门？",
+                "criteria": {"售后": "处理退换", "销售": null}
+            },
+            "severity": {
+                "type": "score",
+                "instructions": "评估严重度",
+                "criteria": ["轻度", {"label": "严重", "description": "立即介入"}]
+            }
+        }
+    });
+
+    // 1) /v0/decisions -> typesafe 与 /api/v1/decisions -> openrouter 同方言直通
+    for (path, kind, upstream_path) in [
+        ("/v0/decisions", "typesafe", "/v1/systemone"),
+        ("/api/v1/decisions", "openrouter", "/api/alpha/decisions"),
+    ] {
+        let mut upstream_resp = json!({
+            "model": "native-resolved-model",
+            "answers": {
+                "route_team": {
+                    "type": "choice",
+                    "choice": "售后",
+                    "confidence": 0.9,
+                    "probabilities": {"售后": 0.92, "销售": 0.08}
+                },
+                "severity": {
+                    "type": "score",
+                    "score": 0.8,
+                    "confidence": 0.75,
+                    "legend": {"0": "轻度", "1": {"label": "严重", "description": "立即介入"}},
+                    "probabilities": {"0": 0.2, "1": 0.8}
+                }
+            },
+            "usage": {
+                "input_tokens": 110,
+                "output_tokens": 10,
+                "total_tokens": 120
+            }
+        });
+        if kind == "openrouter" {
+            upstream_resp["usage"]["cost"] = json!(0.0025);
+            upstream_resp["usage"]["input_tokens_details"] = json!({"cached_tokens": 20});
+        }
+        let mock = Mock::at(upstream_path, vec![Reply::ok(upstream_resp.clone())]).await;
+        let mut cfg = config_value(json!({"be": native_backend(&mock.url, kind, 0)}));
+        cfg["usage_policy"] = json!("strict");
+        let gw = gateway(cfg);
+        let (s, _, v) = call_with_header(
+            &gw,
+            path,
+            ts_or_request.to_string(),
+            vec![("authorization", "Bearer offline-client-key")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{path}: {v}");
+        assert_eq!(v["model"], "decora-test");
+        assert_eq!(v["answers"], upstream_resp["answers"]);
+        assert_eq!(v["usage"], upstream_resp["usage"]);
+        assert!(v["usage"].get("decora").is_none());
+        {
+            let seen = mock.state.seen.lock().unwrap();
+            assert_eq!(
+                seen[0].1["model"],
+                if kind == "typesafe" {
+                    "jev-latest"
+                } else {
+                    "typesafe/jev-1.13"
+                }
+            );
+            assert!(seen[0].1["questions"].get("route_team").is_some());
+            assert!(seen[0].1["questions"].get("q0").is_none());
+            assert_eq!(
+                seen[0].1["questions"]["route_team"]["criteria"],
+                json!({"售后": "处理退换", "销售": null})
+            );
+        }
+    }
+
+    // 2) /v1beta/decisions -> gemini 在 usage_policy: strict 下同样正常直通
+    let gem_req = json!({
+        "model": "decora-test",
+        "input": "测试严格模式直通",
+        "questions": {
+            "is_ok": {"type": "noul", "instructions": "ok?"}
+        }
+    });
+    let gem_resp = json!({
+        "answers": {"is_ok": {"type": "noul", "noul": 0.9}},
+        "usage": {
+            "total_input_tokens": 25,
+            "total_output_tokens": 0,
+            "total_tokens": 25,
+            "input_tokens_by_modality": [{"modality": "text", "tokens": 25}]
+        }
+    });
+    let gem_mock = Mock::at("/v1beta/decisions", vec![Reply::ok(gem_resp.clone())]).await;
+    let mut gem_cfg = config_value(json!({"gem": native_backend(&gem_mock.url, "gemini", 0)}));
+    gem_cfg["usage_policy"] = json!("strict");
+    let (s, _, v) = call_with_header(
+        &gateway(gem_cfg),
+        "/v1beta/decisions",
+        gem_req.to_string(),
+        vec![("x-goog-api-key", "offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["usage"].get("decora").is_none());
+    assert_eq!(v["usage"], gem_resp["usage"]);
+
+    // 3) strict 下跨方言非 OpenAI 路由（/v1/decisions -> gemini，/v1beta/decisions -> typesafe）仍返回 400 unsupported_usage
+    let no_hit = Mock::new(vec![]).await;
+    let mut strict_gem_cfg = config_value(json!({"gem": native_backend(&no_hit.url, "gemini", 0)}));
+    strict_gem_cfg["usage_policy"] = json!("strict");
+    let (s, _, v) = call(&gateway(strict_gem_cfg), predicate()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "unsupported_usage");
+
+    let mut strict_ts_cfg = config_value(json!({"ts": native_backend(&no_hit.url, "typesafe", 0)}));
+    strict_ts_cfg["usage_policy"] = json!("strict");
+    let (s, _, v) = call_with_header(
+        &gateway(strict_ts_cfg),
+        "/v1beta/decisions",
+        gem_req.to_string(),
+        vec![("x-goog-api-key", "offline-client-key")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["code"], "unsupported_usage");
+    assert_eq!(no_hit.count(), 0);
+
+    // 4) 直通模式依然严格拦截非法概率、篡改 legend 与非法 usage，返回 502 upstream_protocol_error 且不回退
+    let bad_prob = json!({
+        "model": "jev-latest",
+        "answers": {
+            "route_team": {
+                "type": "choice",
+                "choice": "售后",
+                "confidence": 0.9,
+                "probabilities": {"售后": 0.6, "销售": 0.1}
+            },
+            "severity": {
+                "type": "score",
+                "score": 0.8,
+                "confidence": 0.75,
+                "legend": {"0": "轻度", "1": {"label": "严重", "description": "立即介入"}},
+                "probabilities": {"0": 0.2, "1": 0.8}
+            }
+        },
+        "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11}
+    });
+    let mut bad_legend = bad_prob.clone();
+    bad_legend["answers"]["route_team"]["probabilities"] = json!({"售后": 0.9, "销售": 0.1});
+    bad_legend["answers"]["severity"]["legend"]["1"] = json!("篡改");
+    let mut bad_usage = bad_legend.clone();
+    bad_usage["answers"]["severity"]["legend"]["1"] =
+        json!({"label": "严重", "description": "立即介入"});
+    bad_usage["usage"]["total_tokens"] = json!(999);
+
+    let bad_mock = Mock::at(
+        "/v1/systemone",
+        vec![
+            Reply::ok(bad_prob),
+            Reply::ok(bad_legend),
+            Reply::ok(bad_usage),
+        ],
+    )
+    .await;
+    let fb_mock = Mock::new(vec![]).await;
+    let gw_bad = gateway(config_value(json!({
+        "ts": native_backend(&bad_mock.url, "typesafe", 0),
+        "oa": backend(&fb_mock.url, 1),
+    })));
+    for _ in 0..3 {
+        let (s, _, v) = call_with_header(
+            &gw_bad,
+            "/v0/decisions",
+            ts_or_request.to_string(),
+            vec![("authorization", "Bearer offline-client-key")],
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_GATEWAY, "{v}");
+        assert_eq!(v["error"]["code"], "upstream_protocol_error");
+    }
+    assert_eq!(bad_mock.count(), 3);
+    assert_eq!(fb_mock.count(), 0);
 }

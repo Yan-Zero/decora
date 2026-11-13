@@ -1,6 +1,7 @@
 //! 官方原生协议映射：默认保留真实可用 usage；严格模式拒绝口径或必需明细差异。
 use crate::{
     config::{Backend, BackendKind, UsagePolicy},
+    dialect::Dialect,
     error::ApiError,
     protocol::{
         Answer, ChoiceOption, ChoiceValue, DecisionRequest, DecisionResponse, Question,
@@ -9,8 +10,19 @@ use crate::{
 };
 use serde_json::{Map, Value, json};
 
-/// 检查管理员声明和 adapter 固有边界；绝不靠切换模型规避不兼容。
+/// 检查管理员声明和 adapter 固有边界；默认按 OpenAI 入站方言评估。
 pub fn compatible(
+    backend: &Backend,
+    req: &DecisionRequest,
+    need: &Requirements,
+    usage_policy: UsagePolicy,
+) -> Result<(), ApiError> {
+    compatible_for_dialect(Dialect::Openai, backend, req, need, usage_policy)
+}
+
+/// 按入站方言检查候选后端能力边界；同方言原生直通在 strict usage 下同样放行。
+pub fn compatible_for_dialect(
+    dialect: Dialect,
     backend: &Backend,
     req: &DecisionRequest,
     need: &Requirements,
@@ -30,9 +42,12 @@ pub fn compatible(
     }
     if backend.kind != BackendKind::Openai {
         validate_native_request(req)?;
-        if usage_policy == UsagePolicy::Strict {
-            return Err(ApiError::unsupported("unsupported_usage"));
-        }
+    }
+    if usage_policy == UsagePolicy::Strict
+        && !dialect.matches_backend(backend.kind)
+        && backend.kind != BackendKind::Openai
+    {
+        return Err(ApiError::unsupported("unsupported_usage"));
     }
     Ok(())
 }
