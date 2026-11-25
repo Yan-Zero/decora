@@ -1,12 +1,18 @@
 # Decora
 
-> **Four dialects. One contract. Zero phantoms.**
+> **Kiroween 2026 — Frankenstein Entry**  
+> **Live WASM Protocol Converter Demo:** https://decora.lyanyixin2533.workers.dev/  
+> **Demo Video (2m 30s):** https://youtu.be/cXpT5vSVaP4  
+> *Four dialects. One contract. Zero phantoms.*
 
+[![Live WASM Demo](https://img.shields.io/badge/Live%20Demo-WASM%20Protocol%20Converter-e5a93c?style=flat)](https://decora.lyanyixin2533.workers.dev/)
+[![Demo Video](https://img.shields.io/badge/YouTube-2m%2030s%20Demo-red?logo=youtube)](https://youtu.be/cXpT5vSVaP4)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024%20Edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests: 43 Passing](https://img.shields.io/badge/Offline%20Tests-43%20Passing-brightgreen)](#offline-verification--reproducible-demo)
 [![Security Audit](https://img.shields.io/badge/Cargo%20Audit-0%20Vulnerabilities-blue)](#offline-verification--reproducible-demo)
-[![WASM Demo](https://img.shields.io/badge/Demo-Live%20WASM%20Protocol%20Converter-e5a93c)](#live-wasm-protocol-converter-demo)
+
+[![Decora Live WASM Protocol Converter Demo](docs/wasm-demo-preview.png)](https://decora.lyanyixin2533.workers.dev/)
 
 **Decora is a standalone, single-tenant multi-dialect Decisions protocol gateway written in Rust.** Every public model alias is served across all four official inbound endpoint dialects (plus `GET /healthz`) using a symmetric **Hub-and-Spoke architecture (`Dialect ↔ Canonical Decision IR ↔ Adapter`)**, allowing SDKs and clients from different ecosystems to route and fail over across any compatible native upstream without rewriting requests:
 
@@ -40,6 +46,8 @@
 ---
 
 ## Live WASM Protocol Converter Demo
+
+- **Hosted Live Demo (no login or API keys required):** https://decora.lyanyixin2533.workers.dev/
 
 Decora’s core Rust protocol engine (`src/protocol.rs`, `src/dialect.rs`, `src/adapter.rs`) compiles directly to WebAssembly (`wasm32-unknown-unknown`, ~525 KB) with zero external JS frameworks or API keys required.
 
