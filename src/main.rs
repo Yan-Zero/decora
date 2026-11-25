@@ -1,10 +1,10 @@
-//! Decora 可执行程序：默认读取当前目录 config.yaml，也可传入单个配置路径。
+//! Decora executable: reads config.yaml from the current directory by default, or accepts a single config path.
 use decora::{Config, Gateway};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 不启用 reqwest/hyper 的 debug tracing，避免运维误设日志级别泄露请求细节。
+    // Keep reqwest/hyper debug tracing disabled to prevent accidental log-level changes from exposing request details.
     tracing_subscriber::fmt()
         .with_env_filter("decora=info")
         .with_target(false)

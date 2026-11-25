@@ -1,24 +1,24 @@
-# 需求文档：OpenRouter 与 TypeSafe/Jev 原生链路及透明 Usage 兼容策略（`native-upstreams-and-usage`）
+# Requirements: OpenRouter and TypeSafe/Jev Native Paths and Transparent Usage Compatibility Policy (`native-upstreams-and-usage`)
 
-## 背景与目标
+## Background and Goals
 
-除 OpenAI `/v1/decisions` 外，OpenRouter（`/api/alpha/decisions`）与 TypeSafe/Jev（`/v1/systemone`）也提供原生单次决策接口，但它们采用 `state` + 命名 `questions` 字典 + `noul / choice / score` + `criteria` 协议形状，且返回的 `usage` 不包含完整的 OpenAI 缓存读写与推理细分（TypeSafe 的 `input_tokens` 更是 `billable_input` 口径）。
+Besides OpenAI `/v1/decisions`, OpenRouter (`/api/alpha/decisions`) and TypeSafe/Jev (`/v1/systemone`) also expose native single-decision endpoints, but they use a `state` + named `questions` dictionary + `noul / choice / score` + `criteria` protocol shape, and the returned `usage` does not include the full OpenAI cached read/write and reasoning breakdown (TypeSafe's `input_tokens` is even on a `billable_input` basis).
 
-本 Spec 目标是实现 OpenRouter 与 TypeSafe/Jev 的真实 HTTP 原生适配器，并引入服务端 `usage_policy: compatible | strict`，在不伪造任何未知 token 零值的前提下支持跨上游路由与回退。
+The goal of this spec is to implement real HTTP native adapters for OpenRouter and TypeSafe/Jev, and to introduce a server-side `usage_policy: compatible | strict`, supporting cross-upstream routing and fallback without fabricating zero values for any unknown tokens.
 
 ---
 
-## 需求列表
+## Requirements
 
-### 需求 1：OpenRouter 与 TypeSafe/Jev 原生协议映射
-- **验收标准 1.1**：支持 `BackendKind::Openrouter`（默认端点 `https://openrouter.ai/api/alpha/decisions`）与 `BackendKind::Typesafe`（默认端点 `https://api.typesafe.ai/v1/systemone`）。
-- **验收标准 1.2**：将 OpenAI 题目数组按序映射为内部稳定键 `q0..qN-1`（支持客户端省略或重复题目 `name`），并将 `predicate` 映射为 `noul`、`choice` 映射为 `criteria` 对象、`score` 映射为 `criteria` 数组。
-- **验收标准 1.3**：将上游返回的 `answers[q0..qN-1]` 按原始题目顺序与原始 `name` 还原为 OpenAI 答案数组，并继续执行严格的概率和（`0.0001` 容差）、最大概率选中项及 `score` 加权期望校验。
-- **验收标准 1.4**：对上游未定义的逐题 `refusal` 或未知答案类型返回 `502 upstream_protocol_error`，不伪造否定答案、不盲目回退。
+### Requirement 1: Native protocol mapping for OpenRouter and TypeSafe/Jev
+- **Acceptance Criteria 1.1**: Support `BackendKind::Openrouter` (default endpoint `https://openrouter.ai/api/alpha/decisions`) and `BackendKind::Typesafe` (default endpoint `https://api.typesafe.ai/v1/systemone`).
+- **Acceptance Criteria 1.2**: Map the OpenAI question array in order to internal stable keys `q0..qN-1` (supporting clients that omit or duplicate question `name`s), and map `predicate` to `noul`, `choice` to a `criteria` object, and `score` to a `criteria` array.
+- **Acceptance Criteria 1.3**: Restore upstream `answers[q0..qN-1]` into the OpenAI answer array in the original question order and with the original `name`s, and continue to enforce the strict probability sum (`0.0001` tolerance), max-probability selection, and `score`-weighted expectation validation.
+- **Acceptance Criteria 1.4**: For per-question `refusal` or unknown answer types not defined by the upstream, return `502 upstream_protocol_error`; do not fabricate negative answers and do not blindly fall back.
 
-### 需求 2：透明 Usage 兼容策略（`usage_policy`）
-- **验收标准 2.1**：服务端 `config.yaml` 提供 `usage_policy: compatible`（默认）与 `usage_policy: strict`；该选项不属于客户端请求参数。
-- **验收标准 2.2**：在 `compatible` 模式下，保留上游真实提供的 `input_tokens`、`output_tokens` 及已知明细，省略未知明细（绝不填 `0`），并添加 `usage.decora` 扩展字段标明 `provider`、`input_tokens_basis`、`total_tokens_basis`、`details_complete` 及可选 `provider_cost`。
-- **验收标准 2.3**：TypeSafe 的 `input_tokens_basis` 明确标记为 `"billable_input"`；OpenRouter 标记为 `"provider_reported"`。
-- **验收标准 2.4**：在 `strict` 模式下，发请求前直接排除无法提供完整精确 OpenAI usage 的上游候选；若无兼容候选则返回 `400 unsupported_usage`。
-- **验收标准 2.5**：原生 OpenAI 后端在任何模式下均严格校验完整的 OpenAI `usage` 结构。
+### Requirement 2: Transparent usage compatibility policy (`usage_policy`)
+- **Acceptance Criteria 2.1**: The server-side `config.yaml` provides `usage_policy: compatible` (default) and `usage_policy: strict`; this option is not a client request parameter.
+- **Acceptance Criteria 2.2**: In `compatible` mode, retain the `input_tokens`, `output_tokens`, and known details actually provided by the upstream, omit unknown details (never fill `0`), and add a `usage.decora` extension field indicating `provider`, `input_tokens_basis`, `total_tokens_basis`, `details_complete`, and optional `provider_cost`.
+- **Acceptance Criteria 2.3**: TypeSafe's `input_tokens_basis` is explicitly marked as `"billable_input"`; OpenRouter's is marked as `"provider_reported"`.
+- **Acceptance Criteria 2.4**: In `strict` mode, exclude upfront, before sending the request, any upstream candidate that cannot provide complete and exact OpenAI usage; if no compatible candidate exists, return `400 unsupported_usage`.
+- **Acceptance Criteria 2.5**: The native OpenAI backend strictly validates the complete OpenAI `usage` structure in every mode.

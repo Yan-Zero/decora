@@ -65,7 +65,8 @@ printf '$ curl -s "$BASE/healthz" | jq -c .\n'
 jq -ce 'select(.status == "ok")' "$RUNTIME/health.json"
 
 # One request shared by every public provider alias; only model changes.
-jq -n '{model:"decora-openai",input:[{role:"system",content:"你是售后分单助手。"},{role:"user",content:[{type:"input_text",text:"包裹破损，请今天换货。"},{type:"input_json",data:{order:"A17",damaged:true}}]}],questions:[{type:"predicate",name:"damaged",instructions:"包裹是否破损？"},{type:"choice",name:"team",instructions:"选择分单标签。",choices:[{value:true},{value:"true"},{value:"售后"}]},{type:"score",name:"urgency",instructions:"处理紧迫性。",levels:[{label:"低"},{label:"高"}]}]}' >"$RUNTIME/support.json"
+# Includes mixed boolean/string/Unicode ("售后") choice values to verify lossless round-tripping.
+jq -n '{model:"decora-openai",input:[{role:"system",content:"You are an after-sales triage assistant."},{role:"user",content:[{type:"input_text",text:"The package arrived damaged; please replace it today."},{type:"input_json",data:{order:"A17",damaged:true}}]}],questions:[{type:"predicate",name:"damaged",instructions:"Is the package damaged?"},{type:"choice",name:"team",instructions:"Select the routing label.",choices:[{value:true},{value:"true"},{value:"售后"}]},{type:"score",name:"urgency",instructions:"Rate handling urgency.",levels:[{label:"Low"},{label:"High"}]}]}' >"$RUNTIME/support.json"
 post() {
   local path="$1" input="$2" expected="${3:-200}" status
   status="$(curl --noproxy '*' -sS --max-time 70 -o "$RUNTIME/response.json" -w '%{http_code}' \
@@ -92,10 +93,10 @@ jq -rs -f "$ROOT/demo/table.jq" "$RUNTIME/opinions.jsonl"
 
 label="$(jq -r .labels.gemini "$RUNTIME/state.json")"
 printf '\n# Gemini -> Gemini: native keys preserved (%s)\n' "$label"
-jq -n '{model:"decora-gemini",input:"包裹破损，请今天换货。",questions:{damage:{type:"noul",instructions:"包裹是否破损？"},route:{type:"choice",instructions:"分单",criteria:{support:"售后",sales:"销售"}},urgency:{type:"score",instructions:"紧迫性",criteria:["低","高"]}}}' >"$RUNTIME/gemini.json"
+jq -n '{model:"decora-gemini",input:"The package arrived damaged; please replace it today.",questions:{damage:{type:"noul",instructions:"Is the package damaged?"},route:{type:"choice",instructions:"Select team",criteria:{support:"After-sales",sales:"Sales"}},urgency:{type:"score",instructions:"Urgency",criteria:["Low","High"]}}}' >"$RUNTIME/gemini.json"
 printf '$ curl -s "$BASE/v1beta/decisions" -H "Content-Type: application/json" -d @gemini.json | jq -c .\n'
 post /v1beta/decisions "$RUNTIME/gemini.json"
-jq -ce 'select(.answers.damage.type == "noul" and .answers.route.probabilities.support != null and .answers.urgency.legend["1"] == "高" and .usage.decora == null) | {model,answers,usage}' "$RUNTIME/response.json"
+jq -ce 'select(.answers.damage.type == "noul" and .answers.route.probabilities.support != null and .answers.urgency.legend["1"] == "High" and .usage.decora == null) | {model,answers,usage}' "$RUNTIME/response.json"
 
 printf '\n# Fallback: primary 503 -> TypeSafe backup (loopback mock)\n'
 jq '.model="decora-fallback" | .questions=[.questions[0]]' "$RUNTIME/support.json" >"$RUNTIME/fallback.json"

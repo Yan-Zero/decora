@@ -2,12 +2,12 @@
   "version": "v1",
   "hooks": [
     {
-      "name": "结束前提醒完整验证",
+      "name": "Remind to run full verification before finishing",
       "trigger": "Stop",
-      "description": "代码改动结束前提醒运行完整验证并同步文档。",
+      "description": "Before finishing code changes, remind the agent to run the full verification suite and synchronize the documentation.",
       "action": {
         "type": "agent",
-        "prompt": "若本轮修改了 src/、tests/ 或 Cargo.toml：确认已按顺序实际运行 cargo fmt --check、cargo check --locked、cargo test --locked、cargo clippy --locked --all-targets -- -D warnings 并全部通过；若合同/配置有变，确认 README.md、docs/PROTOCOL.md、config.example.yaml、HANDOFF.md 已同步，且 usage 例外的表述一致。未运行的检查要如实说明，不得声称已通过。"
+        "prompt": "If this session changed src/, tests/, or Cargo.toml, confirm that cargo fmt --check, cargo check --locked, cargo test --locked, and cargo clippy --locked --all-targets -- -D warnings were actually run in that order and all passed. If the contract or configuration changed, confirm that README.md, docs/PROTOCOL.md, config.example.yaml, and HANDOFF.md are synchronized and describe the usage exception consistently. Report checks that were not run honestly; never claim they passed."
       }
     }
   ]

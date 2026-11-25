@@ -1,10 +1,10 @@
-//! OpenAI Decisions 请求和响应合同；不修补概率、不猜测 token 明细。
+//! OpenAI Decisions request and response contract; probabilities are not adjusted and token details are not guessed.
 use crate::{config::UsagePolicy, error::ApiError};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// 验证后的请求；input/instructions 保持原始多模态内容，不扁平化角色。
+/// Validated request; input/instructions retain their original multimodal content without flattening roles.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionRequest {
@@ -18,7 +18,7 @@ pub struct DecisionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_options: Option<Value>,
 }
-/// 三种原生题型。name 可省略，响应中会明确返回 null。
+/// Three native question types. name is optional and is explicitly returned as null in the response.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Question {
@@ -40,7 +40,7 @@ pub enum Question {
         levels: Vec<ScoreLevel>,
     },
 }
-/// 字符串 "true" 和布尔 true 是不同选项。
+/// The string "true" and the boolean true are distinct choices.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChoiceValue {
@@ -56,14 +56,14 @@ impl PartialEq for ChoiceValue {
         }
     }
 }
-/// 离散选项的值和可选说明。
+/// A discrete choice value and optional description.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChoiceOption {
     pub value: ChoiceValue,
     pub description: Option<String>,
 }
-/// 从零开始的有序评分等级；label 不是任意数值刻度。
+/// Ordered score levels indexed from zero; label is not an arbitrary numeric scale.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScoreLevel {
@@ -71,7 +71,7 @@ pub struct ScoreLevel {
     pub description: Option<String>,
 }
 impl Question {
-    /// 题型名称，用于能力匹配。
+    /// Question type name, used for capability matching.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Predicate { .. } => "predicate",
@@ -79,7 +79,7 @@ impl Question {
             Self::Score { .. } => "score",
         }
     }
-    /// 原始相关名称；不要求唯一，映射 adapter 使用内部索引键。
+    /// Original associated name; uniqueness is not required, and the adapter uses internal index keys for mapping.
     pub fn name(&self) -> &Option<String> {
         match self {
             Self::Predicate { name, .. } | Self::Choice { name, .. } | Self::Score { name, .. } => {
@@ -87,7 +87,7 @@ impl Question {
             }
         }
     }
-    /// 原始文字或多模态题目说明。
+    /// Original text or multimodal question instructions.
     pub fn instructions(&self) -> &Value {
         match self {
             Self::Predicate { instructions, .. }
@@ -96,7 +96,7 @@ impl Question {
         }
     }
 }
-/// 请求的实际能力需求，供路由器先过滤再尝试。
+/// Actual capabilities required by the request, used by the router to filter candidates before trying them.
 #[derive(Default)]
 pub struct Requirements {
     pub images: usize,
@@ -247,7 +247,7 @@ fn parts(v: &Value, mode: &str, cache_allowed: bool, r: &mut Requirements) -> Re
     Ok(())
 }
 impl DecisionRequest {
-    /// 根据官方 schema 校验输入，网关另施加更小的图像/HTTP body 限制。
+    /// Validate input against the official schema; the gateway also enforces smaller image and HTTP body limits.
     pub fn parse(value: Value, max_images: usize) -> Result<(Self, Requirements), ApiError> {
         if let Some(qs) = value["questions"].as_array() {
             for q in qs {
@@ -394,11 +394,11 @@ impl DecisionRequest {
         }
         Ok((req, r))
     }
-    /// 生成 OpenAI 原生请求，只替换管理员指定的 backend model。
+    /// Generate a native OpenAI request, replacing only the backend model specified by the administrator.
     pub fn openai_body(&self, model: &str) -> Value {
         let mut body = serde_json::to_value(self).expect("validated JSON");
         body["model"] = json!(model);
-        // 可选 description 不能发送 null。
+        // Optional descriptions must not be sent as null.
         for q in body["questions"].as_array_mut().unwrap() {
             for field in ["choices", "levels"] {
                 if let Some(items) = q.get_mut(field).and_then(Value::as_array_mut) {
@@ -413,7 +413,7 @@ impl DecisionRequest {
         body
     }
 }
-/// 核心答案响应；usage 可按显式策略部分兼容，拒答仍然是成功响应的一项。
+/// Core answer response; usage may be partially compatible under an explicit policy, and refusals remain part of successful responses.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionResponse {
@@ -421,7 +421,7 @@ pub struct DecisionResponse {
     pub answers: Vec<Answer>,
     pub usage: Usage,
 }
-/// 原生答案；保留独立 confidence，不把它强行等同于最大类别概率。
+/// Native answer; preserve confidence separately rather than equating it with the highest class probability.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Answer {
@@ -445,14 +445,14 @@ pub enum Answer {
         name: Option<String>,
     },
 }
-/// 某个离散选项的原生概率。
+/// Native probability of a discrete choice.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChoiceProbability {
     pub value: ChoiceValue,
     pub probability: f64,
 }
-/// 评分等级的从零开始索引、原始 label 与原生概率。
+/// Zero-based score-level index, original label, and native probability.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScoreProbability {
@@ -460,7 +460,7 @@ pub struct ScoreProbability {
     pub label: String,
     pub probability: f64,
 }
-/// Token 统计；兼容模式允许省略未知明细，但从不填零猜测。
+/// Token statistics; compatible mode allows unknown details to be omitted and never guesses by filling in zeros.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -471,11 +471,11 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
     pub total_tokens: i32,
-    /// 原生跨协议转换的来源与口径扩展；OpenAI 原生响应不添加此字段。
+    /// Source and counting-basis metadata for native cross-protocol conversion; not added to native OpenAI responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decora: Option<UsageMetadata>,
 }
-/// 已知的缓存明细；缺失值仍为未知，不等于零。
+/// Known cache details; missing values remain unknown and are not treated as zero.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputTokensDetails {
@@ -484,14 +484,14 @@ pub struct InputTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<i32>,
 }
-/// 已知的推理 token 明细。
+/// Known reasoning-token details.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputTokensDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<i32>,
 }
-/// 经过原生协议适配的提供方，而非内部后端 ID 或 URL。
+/// Provider after native protocol adaptation, not an internal backend ID or URL.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageProvider {
@@ -500,7 +500,7 @@ pub enum UsageProvider {
     Typesafe,
     Gemini,
 }
-/// input_tokens 的真实计数口径，不将计费输入冒充总输入。
+/// Actual counting basis for input_tokens; billable input is not represented as total input.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InputTokenBasis {
@@ -509,7 +509,7 @@ pub enum InputTokenBasis {
     BillableInput,
     TotalInputTokens,
 }
-/// total_tokens 是哪一种输入口径与输出计数之和。
+/// Specifies which input basis is summed with the output count to produce total_tokens.
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TotalTokenBasis {
@@ -518,7 +518,7 @@ pub enum TotalTokenBasis {
     BillableInputPlusOutput,
     TotalInputPlusOutput,
 }
-/// 兼容响应扩展：清楚标记来源、输入口径、总量推导及明细完整性。
+/// Compatible-response extension that clearly records the source, input basis, total derivation, and detail completeness.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetadata {
@@ -532,7 +532,7 @@ pub struct UsageMetadata {
     pub input_tokens_by_modality: Option<Vec<Value>>,
 }
 impl Usage {
-    /// 是否具备 OpenAI 所要求的全部明细；不代表不同上游的计数口径相同。
+    /// Whether all details required by OpenAI are present; this does not mean different upstreams use the same counting basis.
     pub fn details_complete(&self) -> bool {
         self.input_tokens_details
             .as_ref()
@@ -558,7 +558,7 @@ impl Usage {
         if policy == UsagePolicy::Strict && (!self.details_complete() || self.decora.is_some()) {
             return Err(ApiError::protocol());
         }
-        // billable input 未承诺包含全部缓存 token，不能拿它做 OpenAI 口径的缓存上界。
+        // Billable input is not guaranteed to include all cached tokens, so it cannot serve as the cache upper bound under OpenAI semantics.
         let comparable_input = self
             .decora
             .as_ref()
@@ -635,11 +635,11 @@ fn probability(p: f64) -> bool {
 }
 const EPS: f64 = 0.0001;
 impl DecisionResponse {
-    /// 验证题序、名称、选项覆盖、概率和、评分期望及 usage 守恒。
+    /// Validate question order, names, choice coverage, probability sums, score expectations, and usage conservation.
     pub fn parse(value: Value, req: &DecisionRequest) -> Result<Self, ApiError> {
         Self::parse_with_usage(value, req, UsagePolicy::Strict)
     }
-    /// 校验相同的核心答案合同，并按显式策略验证 usage 明细与来源口径。
+    /// Validate the same core answer contract, and validate usage details and source basis according to the explicit policy.
     pub fn parse_with_usage(
         value: Value,
         req: &DecisionRequest,

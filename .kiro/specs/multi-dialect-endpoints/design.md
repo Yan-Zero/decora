@@ -1,6 +1,6 @@
-# 设计文档：多方言入站端点与对称中心辐射式协议架构（`multi-dialect-endpoints`）
+# Design: Multi-Dialect Inbound Endpoints and Symmetric Hub-and-Spoke Protocol Architecture (`multi-dialect-endpoints`)
 
-## 1. 中心辐射式（Hub-and-Spoke）三阶段流水线
+## 1. Three-Stage Hub-and-Spoke Pipeline
 
 ```text
   [OpenAI Client]       POST /v1/decisions      ──┐
@@ -10,57 +10,57 @@
                                               Canonical IR (DecisionRequest, Requirements)
                                                             │
                                                             ▼
-                                              Gateway::execute (路由 + Adapter + 数学不变量校验)
+                                              Gateway::execute (routing + Adapter + mathematical invariant checks)
                                                             │
                                                             ▼
                                               Canonical IR (DecisionResponse)
                                                             │
                                                             ▼
-                                              Dialect::format_response ──► 返回对应方言响应
+                                              Dialect::format_response ──► return response in the corresponding dialect
 ```
 
-## 2. 模块设计与职责重构
+## 2. Module Design and Responsibility Refactoring
 
-### 2.1 `src/dialect.rs`（新增）
-- 定义 `#[derive(Clone, Copy, PartialEq, Eq)] pub enum Dialect { Openai, Gemini, Typesafe, Openrouter }`。
-- **`Dialect::parse_request(self, value: Value, max_images: usize) -> Result<(DecisionRequest, Requirements), ApiError>`**：
-  - `Dialect::Openai`：直接委托 `DecisionRequest::parse(value, max_images)`。
-  - `Dialect::Gemini`：
-    - 校验顶层仅含 `["model", "input", "questions"]` 且均存在。
-    - 若 `input` 为字符串，原样保留；若 `input` 为非空数组（`<= 16384`），将每项 `{"text": s}` 转换为 `{"type": "input_text", "text": s}`，将 `{"inline_data": {"mime_type": m, "data": d}}`（校验 `m` 不含 `;`）转换为 `{"type": "input_image", "image_url": format!("data:{m};base64,{d}")}`，包裹为单条 `role: "user"` 消息交由 `DecisionRequest::parse` 统一执行 base64、MIME 与图片上限校验。
-    - 校验 `questions` 为非空对象（`1..=400`），每个键 `k` 满足 `1..=64` 位 ASCII `[A-Za-z0-9_-]`；
-      - `type == "noul"` -> `Question::Predicate { name: Some(k), instructions }`（`instructions` 必须为字符串）；
-      - `type == "choice"` -> 校验 `criteria` 为 `2..=255` 项对象，键为 `1..=128` 位无首尾空白纯 ASCII 字符串，值为描述字符串 `s`（保持 `description: Some(s)` 以便响应还原）；
-      - `type == "score"` -> 校验 `criteria` 为 `2..=10` 项非空字符串数组，映射为 `ScoreLevel { label, description: None }`。
-  - `Dialect::Typesafe | Dialect::Openrouter`：
-    - 校验顶层仅含 `["model", "state", "questions"]` 且均存在，`state` 必须为字符串。
-    - 校验 `questions` 为非空对象（`1..=400`），每个键 `k` 为非空字符串：
-      - `type == "noul"` -> `Question::Predicate { name: Some(k), instructions }`（`instructions` 必须为字符串）；
-      - `type == "choice"` -> 校验 `criteria` 为 `2..=255` 项对象，键为字符串，值为 `null`（`description: None`）或字符串 `s`（`description: Some(s)`）；
-      - `type == "score"` -> 校验 `criteria` 为 `2..=10` 项数组，元素为字符串 `label`（`description: None`）或 `{"label": s, "description"?: d}`（`description` 不能为 `null`）。
-- **`Dialect::format_response(self, req: &DecisionRequest, resp: DecisionResponse) -> Result<Value, ApiError>`**：
-  - `Dialect::Openai`：直接序列化 `resp`。
-  - `Dialect::Gemini | Dialect::Typesafe | Dialect::Openrouter`：
-    - 遍历 `resp.answers.iter().zip(&req.questions)`：
-      - 若遇到 `Answer::Refusal`，立即返回 `ApiError::new(StatusCode::BAD_GATEWAY, "upstream_refusal_unrepresentable", "当前入口协议不支持逐题 refusal 表达；未伪造概率。")`。
-      - `Answer::Predicate { probability, .. }` -> `{"type": "noul", "noul": probability}`。
-      - `Answer::Choice { choice, confidence, probabilities, .. }` -> 将 `choice` 与 `probabilities` 还原为以选项字符串为键的对象。
-      - `Answer::Score { score, confidence, probabilities, .. }` -> 将 `probabilities` 转换为 `"0"..` 索引对象，并构造 `legend`（Gemini 下为字符串 `l.label`；TypeSafe/OpenRouter 下若 `l.description` 为 `Some(d)` 则为 `{"label": l.label, "description": d}`，否则为 `l.label`）。
-    - 构造方言对应的 `usage`：
-      - 当 `resp.usage.decora` 为 `None`（即上游为 OpenAI 原生后端）且当前入站方言非 OpenAI 时，自动补齐 `decora` 元数据：
-        `{"provider": "openai", "input_tokens_basis": "openai_input_tokens", "total_tokens_basis": "openai_input_plus_output", "details_complete": true}`。
-      - `Dialect::Gemini` 输出 `total_input_tokens`、`total_output_tokens`、`total_tokens`、可选 `input_tokens_by_modality` 及 `decora`。
-      - `Dialect::Typesafe | Dialect::Openrouter` 输出 `input_tokens`、`output_tokens`、`total_tokens`、可选 `input_tokens_details / output_tokens_details` 及 `decora`。
+### 2.1 `src/dialect.rs` (new)
+- Define `#[derive(Clone, Copy, PartialEq, Eq)] pub enum Dialect { Openai, Gemini, Typesafe, Openrouter }`.
+- **`Dialect::parse_request(self, value: Value, max_images: usize) -> Result<(DecisionRequest, Requirements), ApiError>`**:
+  - `Dialect::Openai`: delegate directly to `DecisionRequest::parse(value, max_images)`.
+  - `Dialect::Gemini`:
+    - Validate that the top-level object contains only `['model', 'input', 'questions']` and that all are present.
+    - If `input` is a string, preserve it unchanged. If it is a non-empty array (`<= 16384`), convert each `{"text": s}` to `{"type": "input_text", "text": s}` and each `{"inline_data": {"mime_type": m, "data": d}}` (validate that `m` contains no `;`) to `{"type": "input_image", "image_url": format!("data:{m};base64,{d}")}`. Wrap the result in a single `role: "user"` message and pass it to `DecisionRequest::parse` for shared base64, MIME, and image-count validation.
+    - Validate that `questions` is a non-empty object (`1..=400`) and each key `k` contains `1..=64` ASCII `[A-Za-z0-9_-]` characters:
+      - `type == "noul"` -> `Question::Predicate { name: Some(k), instructions }` (`instructions` must be a string).
+      - `type == "choice"` -> validate `criteria` as an object with `2..=255` entries, keys that are `1..=128` plain ASCII characters without leading or trailing whitespace, and string descriptions `s` as values (preserve `description: Some(s)` so responses can reproduce them).
+      - `type == "score"` -> validate `criteria` as an array with `2..=10` non-empty strings, mapped to `ScoreLevel { label, description: None }`.
+  - `Dialect::Typesafe | Dialect::Openrouter`:
+    - Validate that the top-level object contains only `['model', 'state', 'questions']` and that all are present; `state` must be a string.
+    - Validate that `questions` is a non-empty object (`1..=400`) and each key `k` is a non-empty string:
+      - `type == "noul"` -> `Question::Predicate { name: Some(k), instructions }` (`instructions` must be a string).
+      - `type == "choice"` -> validate `criteria` as an object with `2..=255` entries, string keys, and values that are either `null` (`description: None`) or strings `s` (`description: Some(s)`).
+      - `type == "score"` -> validate `criteria` as an array with `2..=10` entries, each either a string `label` (`description: None`) or `{"label": s, "description"?: d}` (`description` cannot be `null`).
+- **`Dialect::format_response(self, req: &DecisionRequest, resp: DecisionResponse) -> Result<Value, ApiError>`**:
+  - `Dialect::Openai`: serialize `resp` directly.
+  - `Dialect::Gemini | Dialect::Typesafe | Dialect::Openrouter`:
+    - Iterate over `resp.answers.iter().zip(&req.questions)`:
+      - On `Answer::Refusal`, immediately return `ApiError::new(StatusCode::BAD_GATEWAY, "upstream_refusal_unrepresentable", "This dialect cannot express a per-question refusal; no probabilities were fabricated.")`.
+      - `Answer::Predicate { probability, .. }` -> `{"type": "noul", "noul": probability}`.
+      - `Answer::Choice { choice, confidence, probabilities, .. }` -> restore `choice` and `probabilities` as an object keyed by option strings.
+      - `Answer::Score { score, confidence, probabilities, .. }` -> convert `probabilities` to an object indexed by `"0"..` and build `legend` (under Gemini, use the string `l.label`; under TypeSafe/OpenRouter, use `{"label": l.label, "description": d}` if `l.description` is `Some(d)`, otherwise `l.label`).
+    - Build dialect-specific `usage`:
+      - When `resp.usage.decora` is `None` (i.e., the upstream is the native OpenAI backend) and the inbound dialect is not OpenAI, automatically add `decora` metadata:
+        `{"provider": "openai", "input_tokens_basis": "openai_input_tokens", "total_tokens_basis": "openai_input_plus_output", "details_complete": true}`.
+      - `Dialect::Gemini` emits `total_input_tokens`, `total_output_tokens`, `total_tokens`, optional `input_tokens_by_modality`, and `decora`.
+      - `Dialect::Typesafe | Dialect::Openrouter` emits `input_tokens`, `output_tokens`, `total_tokens`, optional `input_tokens_details / output_tokens_details`, and `decora`.
 
-### 2.2 `src/adapter.rs` 精简与去重
-- 提取 `choice_key_for(choices: &[ChoiceOption], index: usize, kind: BackendKind) -> String` 与 `score_criterion(level: &ScoreLevel, kind: BackendKind) -> Value` 两个纯函数。
-- `native_answers_for` 直接使用 `choice_key_for` 和 `score_criterion` 校验 `legend`，消除原先在响应解析阶段重新构造整份 `native_body_for` 的冗余开销。
-- 提取统一的 `non_negative_i32(source: &Map<String, Value>, key: &str) -> Result<i32, ApiError>` 辅助函数，消除 Gemini 与 OpenRouter/TypeSafe 之间的重复闭包。
+### 2.2 Streamlining and Deduplicating `src/adapter.rs`
+- Extract two pure functions: `choice_key_for(choices: &[ChoiceOption], index: usize, kind: BackendKind) -> String` and `score_criterion(level: &ScoreLevel, kind: BackendKind) -> Value`.
+- Have `native_answers_for` use `choice_key_for` and `score_criterion` directly to validate `legend`, eliminating the redundant work of rebuilding the entire `native_body_for` during response parsing.
+- Extract a shared `non_negative_i32(source: &Map<String, Value>, key: &str) -> Result<i32, ApiError>` helper, eliminating duplicated closures across Gemini and OpenRouter/TypeSafe.
 
-### 2.3 `src/gateway.rs` 多端点挂载与双轨鉴权
-- 在 `Gateway::router` 中挂载四个入站路由：
+### 2.3 Multi-Endpoint Mounting and Dual-Mode Authentication in `src/gateway.rs`
+- Mount four inbound routes in `Gateway::router`:
   - `POST /v1/decisions` -> `Dialect::Openai`
   - `POST /v1beta/decisions` -> `Dialect::Gemini`
   - `POST /v0/decisions` -> `Dialect::Typesafe`
   - `POST /api/v1/decisions` -> `Dialect::Openrouter`
-- 在 `guard` 中提取辅助函数校验 `Authorization: Bearer <key>` 或 `x-goog-api-key: <key>`（互斥、单值、定长比较 `ct_eq`）。
+- Extract a helper in `guard` to validate either `Authorization: Bearer <key>` or `x-goog-api-key: <key>` (mutually exclusive, single-valued, fixed-length `ct_eq` comparison).

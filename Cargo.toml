@@ -2,7 +2,7 @@
 name = "decora"
 version = "0.1.0"
 edition = "2024"
-description = "严格协议边界的 OpenAI Decisions 网关"
+description = "Multi-dialect Decisions protocol gateway with strict probability and capability contracts"
 license = "MIT"
 
 [dependencies]

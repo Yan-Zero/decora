@@ -1,4 +1,4 @@
-//! 多前端 Decisions 方言编解码：同方言原生直通（仅替换 model 且保留数学/usage 校验），异构方言经标准中间表示无损互转。
+//! Multi-frontend Decisions dialect encoding and decoding: same-dialect native passthrough (replacing only model while retaining math/usage validation), and lossless conversion between heterogeneous dialects through a canonical intermediate representation.
 use crate::{
     config::{BackendKind, UsagePolicy},
     error::ApiError,
@@ -7,7 +7,7 @@ use crate::{
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 
-/// 支持的 Decisions 入站协议方言。
+/// Supported inbound Decisions protocol dialects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Openai,
@@ -88,7 +88,7 @@ fn token_i32(source: &Map<String, Value>, key: &str) -> Result<i32, ApiError> {
 }
 
 impl Dialect {
-    /// 判断入站端点方言是否与目标后端协议同构（可启用原生直通）。
+    /// Determine whether the inbound endpoint dialect matches the target backend protocol, enabling native passthrough.
     pub fn matches_backend(self, kind: BackendKind) -> bool {
         matches!(
             (self, kind),
@@ -99,7 +99,7 @@ impl Dialect {
         )
     }
 
-    /// 构造同方言原生直通请求体：保留客户端原始字段与键名，仅替换顶层 model。
+    /// Build a same-dialect native passthrough request body, preserving the client's original fields and keys while replacing only the top-level model.
     pub fn passthrough_body(
         self,
         raw_request: &Value,
@@ -114,7 +114,7 @@ impl Dialect {
         body
     }
 
-    /// 校验同方言原生直通响应的数学概率、legend 与 usage 守恒，并原样返回（不注入 usage.decora）。
+    /// Validate mathematical probabilities, legend, and usage conservation in a same-dialect native passthrough response, then return it unchanged (without injecting usage.decora).
     pub fn passthrough_response(
         self,
         raw_request: &Value,
@@ -122,7 +122,7 @@ impl Dialect {
         upstream_body: Value,
     ) -> Result<Value, ApiError> {
         if self == Self::Openai {
-            // OpenAI 官方本来就保证完整 usage；不把其缺项伪装成兼容模式。
+            // OpenAI officially guarantees complete usage; do not disguise missing fields as compatible mode.
             let parsed = DecisionResponse::parse(upstream_body, req)?;
             return serde_json::to_value(parsed).map_err(|_| ApiError::protocol());
         }
@@ -310,7 +310,7 @@ impl Dialect {
             u
         };
 
-        // 复用 DecisionResponse::parse_with_usage 严格验证所有题目的概率和、最大值及期望守恒。
+        // Reuse DecisionResponse::parse_with_usage to strictly validate probability sums, maxima, and expectation conservation for every question.
         DecisionResponse::parse_with_usage(
             json!({
                 "model": req.model,
@@ -326,7 +326,7 @@ impl Dialect {
         Ok(out)
     }
 
-    /// 按入站端点对应的官方方言严格校验请求，并转换为网关内部标准中间表示。
+    /// Strictly validate a request using the official dialect for the inbound endpoint and convert it to the gateway's canonical internal representation.
     pub fn parse_request(
         self,
         value: Value,
@@ -560,7 +560,7 @@ impl Dialect {
         }
     }
 
-    /// 将经过数学与 usage 守恒校验的标准中间响应格式化为入站方言对应的跨方言响应体。
+    /// Format a canonical intermediate response, validated for mathematical and usage conservation, as a response body in the inbound dialect.
     pub fn format_response(
         self,
         req: &DecisionRequest,

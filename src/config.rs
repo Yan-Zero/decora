@@ -1,4 +1,4 @@
-//! YAML 配置只保存环境变量名称；真实凭据在启动时解析，不参与 Debug 输出。
+//! YAML configuration stores only environment variable names; actual credentials are resolved at startup and are not included in Debug output.
 use reqwest::Url;
 use serde::Deserialize;
 use std::{
@@ -38,18 +38,18 @@ fn types() -> Vec<String> {
     vec!["predicate".into(), "choice".into(), "score".into()]
 }
 
-/// Usage 兼容策略；兼容模式不填充未知明细，严格模式要求完整 OpenAI 口径。
+/// Usage compatibility policy; compatible mode does not fill in unknown details, while strict mode requires complete OpenAI semantics.
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsagePolicy {
-    /// 默认：保留已知计数并在 native usage.decora 中标明来源和计数口径。
+    /// Default: preserve known counts and record their source and counting basis in native usage.decora.
     #[default]
     Compatible,
-    /// 只有完整、精确的 OpenAI usage 合同才能进入候选池。
+    /// Only candidates with a complete, exact OpenAI usage contract are eligible.
     Strict,
 }
 
-/// 上游原生协议；不包含聊天 completions 兼容模式。
+/// Native upstream protocols; chat completions compatibility mode is not included.
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
@@ -59,7 +59,7 @@ pub enum BackendKind {
     Gemini,
 }
 impl BackendKind {
-    /// 官方固定入口；配置可由管理员替换为可信入口。
+    /// Fixed official endpoint; an administrator may replace it with a trusted endpoint.
     pub fn endpoint(self) -> &'static str {
         match self {
             Self::Openai => "https://api.openai.com/v1/decisions",
@@ -69,7 +69,7 @@ impl BackendKind {
         }
     }
 }
-/// 管理员声明的上游模型能力；不能扩大 adapter 固有能力。
+/// Upstream model capabilities declared by the administrator; these cannot exceed the adapter's built-in capabilities.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
@@ -84,7 +84,7 @@ pub struct Capabilities {
     #[serde(default = "questions")]
     pub max_questions: usize,
 }
-/// 一个候选固定对应一个模型、端点和凭据环境变量。
+/// Each candidate is bound to one model, endpoint, and credential environment variable.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
@@ -98,7 +98,7 @@ pub struct Backend {
     pub weight: u32,
     pub capabilities: Capabilities,
 }
-/// Decora 单租户配置。非 loopback 监听必须显式授权并配置入站鉴权。
+/// Decora single-tenant configuration. Non-loopback listening requires explicit authorization and inbound authentication.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -129,20 +129,20 @@ pub struct Config {
     pub models: BTreeMap<String, Vec<String>>,
 }
 impl Config {
-    /// 读取 YAML；错误不包含文件内容或可能的凭据。
+    /// Read YAML; errors do not include file contents or possible credentials.
     pub fn load(path: &Path) -> Result<Self, String> {
         let content =
             std::fs::read_to_string(path).map_err(|_| "cannot read the config file".to_owned())?;
         Self::from_yaml(&content)
     }
-    /// 解析和验证 YAML（支持 api_key_env/bearer_key_env，禁止内联密钥）。
+    /// Parse and validate YAML (supports api_key_env/bearer_key_env; inline keys are forbidden).
     pub fn from_yaml(content: &str) -> Result<Self, String> {
         let cfg: Self = serde_saphyr::from_str(content)
             .map_err(|_| "config YAML has invalid fields or types".to_owned())?;
         cfg.validate()?;
         Ok(cfg)
     }
-    /// 拒绝无界重试、明文远端凭据、无鉴权公网监听和无效候选。
+    /// Reject unbounded retries, plaintext remote credentials, unauthenticated public listeners, and invalid candidates.
     pub fn validate(&self) -> Result<(), String> {
         let bad = || "config has an invalid range, capability or route".to_owned();
         if !self.listen.ip().is_loopback()
@@ -223,7 +223,7 @@ fn check_env_name(name: &str) -> Result<(), String> {
     }
     Ok(())
 }
-/// 解析凭据；调用者传入解析器以便离线测试不修改进程环境。
+/// Resolve credentials; the caller supplies a lookup function so offline tests do not modify the process environment.
 pub fn resolve_secret(
     name: &str,
     lookup: &impl Fn(&str) -> Option<String>,

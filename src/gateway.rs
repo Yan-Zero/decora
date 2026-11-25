@@ -1,4 +1,4 @@
-//! HTTP 服务、连接复用、带能力过滤的加权优先级路由和有界故障回退。
+//! HTTP service, connection reuse, capability-filtered weighted-priority routing, and bounded failure fallback.
 use crate::{
     adapter::{compatible_for_dialect, native_body_for, native_response},
     config::{Backend, BackendKind, Config, resolve_secret},
@@ -31,7 +31,7 @@ struct RuntimeBackend {
 }
 #[derive(Clone, Copy)]
 struct Deadline(Instant);
-/// 可廉价 clone 的服务状态；所有请求共用一个 reqwest 连接池。
+/// Cheaply cloneable service state; all requests share one reqwest connection pool.
 #[derive(Clone)]
 pub struct Gateway {
     inner: Arc<Inner>,
@@ -44,11 +44,11 @@ struct Inner {
     slots: Arc<Semaphore>,
 }
 impl Gateway {
-    /// 使用环境变量解析配置，构造启用 TLS 校验且禁止 redirect 的连接池。
+    /// Resolve configuration using environment variables and build a connection pool that verifies TLS and disables redirects.
     pub fn new(config: Config) -> Result<Self, String> {
         Self::with_env(config, |name| std::env::var(name).ok())
     }
-    /// 可注入凭据解析器；离线测试无需真实密钥或修改全局环境。
+    /// Accept an injectable credential lookup; offline tests need neither real keys nor changes to the global environment.
     pub fn with_env(
         config: Config,
         lookup: impl Fn(&str) -> Option<String>,
@@ -90,7 +90,7 @@ impl Gateway {
             }),
         })
     }
-    /// 构造支持多方言 Decisions 入口和最小健康检查的 Router；鉴权发生在 body 读取之前。
+    /// Build a Router with multi-dialect Decisions endpoints and a minimal health check; authentication occurs before the body is read.
     pub fn router(&self) -> Router {
         let decisions = Router::new()
             .route(
@@ -127,7 +127,7 @@ impl Gateway {
             .layer(DefaultBodyLimit::max(self.inner.config.max_body_bytes))
             .with_state(self.clone())
     }
-    /// 实际监听地址；默认 127.0.0.1:8787。
+    /// Actual listening address; defaults to 127.0.0.1:8787.
     pub fn listen(&self) -> std::net::SocketAddr {
         self.inner.config.listen
     }
@@ -251,7 +251,7 @@ impl Gateway {
                             return dialect.passthrough_response(&raw_request, &request, value);
                         }
                         let canonical = match backend.config.kind {
-                            // OpenAI 官方本来就保证完整 usage；不把其缺项伪装成兼容模式。
+                            // OpenAI officially guarantees complete usage; do not disguise missing fields as compatible mode.
                             BackendKind::Openai => DecisionResponse::parse(value, &request)?,
                             kind => native_response(
                                 value,
@@ -286,7 +286,7 @@ impl Gateway {
                         );
                         wait = backoff(attempt);
                     } else if status.is_client_error() {
-                        // 401/403 是服务端配置问题，不误导调用者更换自己的 API key。
+                        // 401/403 indicate a server configuration problem; do not mislead callers into changing their own API key.
                         return Err(ApiError::new(
                             if [401, 403].contains(&status.as_u16()) {
                                 StatusCode::BAD_GATEWAY
@@ -387,7 +387,7 @@ fn weighted_order<'a>(
     }
     ordered
 }
-/// 解析 Retry-After 的秒数或 HTTP 日期；过期日期为 0，不截短未来等待时间。
+/// Parse Retry-After as seconds or an HTTP date; past dates yield 0, and future wait times are not truncated.
 pub fn retry_after(value: Option<&str>, now: SystemTime) -> Option<u64> {
     let value = value?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
@@ -516,7 +516,7 @@ mod tests {
             assert_ne!(order[0], order[1]);
             heavy_first += usize::from(order[0] == "heavy");
         }
-        // 极宽统计界限，避免把采样噪声写成脆弱测试。
+        // Use a wide statistical interval to avoid making the test brittle to sampling noise.
         assert!((8500..9500).contains(&heavy_first));
     }
 }

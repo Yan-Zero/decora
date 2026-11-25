@@ -1,49 +1,53 @@
-# Decora 开发接续记录
+# Decora Development Handoff
 
-## 当前结论：同方言原生直通（Same-Dialect Passthrough）与异构自动转换协同全通
-**Decora 现已在对称中心辐射式（Hub-and-Spoke）多方言架构上支持“按单次尝试动态选择同方言原生直通或异构跨方言自动转换”。43 项测试通过（1 项单测 + 42 项离线集成测试），fmt/check/clippy/audit 全通过。**
+## Current Status: Same-Dialect Passthrough & Cross-Dialect Translation Complete
 
-**尚未完全符合原生 schema 的明确例外：跨方言路由在 `usage_policy: compatible` 下仍允许省略目标方言或 OpenAI 未知的必需明细并增加 `usage.decora`。** 同方言原生直通则原样返回上游原生 `usage`（不注入 `usage.decora`），且在 `usage_policy: strict` 下正常放行。
+**Decora now supports per-attempt dynamic selection between Same-Dialect Native Passthrough and Cross-Dialect Canonical IR Translation on its symmetric Hub-and-Spoke multi-dialect architecture. All 43 tests pass (1 unit test + 42 offline integration tests), and `fmt` / `check` / `clippy` / `audit` are all green.**
 
-## 本轮任务与 Git 起点
-- 任务：完成 `.kiro/specs/dialect-passthrough/` 规范全部 5 项任务，实现 `OpenAI↔OpenAI`、`Gemini↔Gemini`、`TypeSafe↔TypeSafe`、`OpenRouter↔OpenRouter` 同方言原生直通及跨方言自动回退。
-- 路径 `E:\source\toy\decora`；分支 `feat/decisions-gateway`。只本地修改、测试与提交，不推送、不访问付费 API。
+**Explicit native-schema exception**: Under `usage_policy: compatible`, cross-dialect routes still allow omitting unknown target-dialect/OpenAI usage breakdowns and attach `usage.decora` provenance metadata. Same-dialect passthrough returns upstream native `usage` verbatim (without injecting `usage.decora`) and is permitted under `usage_policy: strict`.
 
-## 本轮同方言直通核心实现
+## Milestone Summary
 
-### 1. 同构匹配与按尝试（Per-Attempt）动态切换（`src/dialect.rs` + `src/gateway.rs`）
-- `Dialect::matches_backend(kind)` 定义四类同构配对：`Openai↔Openai`、`Gemini↔Gemini`、`Typesafe↔Typesafe`、`Openrouter↔Openrouter`。
-- `Dialect::passthrough_body`：在同方言直通模式下直接克隆已通过入站校验的原始请求 JSON，仅将顶层 `model` 替换为 `backend.model`，完整保留客户端原始 `questions` 键名、选项键名与 `criteria`（不再重写为 `q0/q1` 或 `decora_choice_0`）。
-- `Gateway::execute`：在每次 `attempt` 循环中动态判断 `dialect.matches_backend(backend.config.kind)`；若同方言主后端因 429/5xx/超时回退至异构备用后端，下一次尝试自动切换为跨方言 Canonical IR 转换（`native_body_for` / `format_response`）。
+- Completed all 5 tasks in `.kiro/specs/dialect-passthrough/`, delivering `OpenAI↔OpenAI`, `Gemini↔Gemini`, `TypeSafe↔TypeSafe`, and `OpenRouter↔OpenRouter` same-dialect passthrough with automatic cross-dialect fallback.
+- Added English external error messages and reproducible loopback-mock / optional live-API demo capture scripts under `demo/`.
+- Added root MIT `LICENSE` file.
 
-### 2. 直通响应的严格校验与零污染透传（`src/dialect.rs`）
-- `Dialect::passthrough_response`：复用了 `DecisionResponse::parse_with_usage` 与原生 `usage` 校验逻辑，严格检查概率有限 `[0, 1]`、分布和与 `score` 加权期望容差 `<= 0.0001`、`choice` 最大概率选中项、`score.legend == raw_request["questions"][key]["criteria"][i]` 以及 token 加和守恒。
-- 校验通过后仅将顶层 `model` 还原为公开 `model` alias，原样返回原生 `answers` 与 `usage`（**不注入 `usage.decora`**，完整保留 OpenRouter `usage.cost` 与 Gemini `input_tokens_by_modality`）。
+## Core Same-Dialect Passthrough Implementation
 
-### 3. `usage_policy: strict` 放行同方言候选（`src/adapter.rs`）
-- `compatible_for_dialect` 在 `usage_policy: strict` 下放行同方言原生候选（例如 `/v1beta/decisions -> gemini`、`/v0/decisions -> typesafe`、`/api/v1/decisions -> openrouter`），同时继续在网络调用前拦截跨方言非 OpenAI 候选（返回 `400 unsupported_usage`）与真实 `input_image`（非 OpenAI 原生后端返回 `400 unsupported_native_images`）。
+### 1. Isomorphic Matching & Per-Attempt Switching (`src/dialect.rs`, `src/gateway.rs`)
+- `Dialect::matches_backend(kind)` defines the four isomorphic pairs: `Openai↔Openai`, `Gemini↔Gemini`, `Typesafe↔Typesafe`, and `Openrouter↔Openrouter`.
+- `Dialect::passthrough_body` clones the validated inbound JSON request and replaces only the top-level `model` with `backend.model`, preserving the client's original `questions` keys, option keys, and `criteria` without rewriting them into `q0`/`q1` or `decora_choice_0`.
+- `Gateway::execute` evaluates `dialect.matches_backend(backend.config.kind)` on every attempt; if a same-dialect primary fails with `429`/`5xx`/timeout and falls back to a heterogeneous backup, the next attempt automatically switches to Canonical IR translation (`native_body_for` / `format_response`).
 
-## 验证结果（2026-11-13）
-按顺序串行执行：
+### 2. Strict Verification & Zero-Pollution Passthrough (`src/dialect.rs`)
+- `Dialect::passthrough_response` reuses `DecisionResponse::parse_with_usage` and native usage validation to verify finite `[0, 1]` probabilities, distribution sum and weighted `score` expectation tolerance `<= 0.0001`, max-probability `choice` selection, exact `score.legend == raw_request["questions"][key]["criteria"][i]`, and token sum conservation.
+- Once verified, only top-level `model` is rewritten back to the public alias; native `answers` and `usage` are returned intact (**no `usage.decora` injection**, preserving OpenRouter `usage.cost` and Gemini `input_tokens_by_modality`).
 
-| 检查 | 实际结果 |
+### 3. Allowing Same-Dialect Candidates under `usage_policy: strict` (`src/adapter.rs`)
+- `compatible_for_dialect` allows same-dialect native candidates under `usage_policy: strict` (`/v1beta/decisions -> gemini`, `/v0/decisions -> typesafe`, `/api/v1/decisions -> openrouter`), while continuing to block cross-dialect non-OpenAI candidates (`400 unsupported_usage`) and real `input_image` payloads on non-OpenAI native backends (`400 unsupported_native_images`) before any network call.
+
+## Verification Results
+
+Executed serially:
+
+| Check | Result |
 |---|---|
-| cargo fmt --check | 通过，无格式差异 |
-| cargo check --locked | 通过（1.00 秒） |
-| cargo test --locked | 1 项单测 + 42 项离线集成测试，共 43 项通过、0 失败；集成测试 0.84 秒 |
-| cargo clippy --locked --all-targets -- -D warnings | 通过，无警告（2.60 秒） |
-| cargo audit --file Cargo.lock | 182 个锁定依赖，1490 条公告库，0 漏洞，1 项 yanked 警告允许 |
+| `cargo fmt --check` | Passed, no formatting diffs |
+| `cargo check --locked` | Passed |
+| `cargo test --locked` | 1 unit test + 42 offline integration tests = 43 passed, 0 failed (< 1 s) |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed, zero warnings |
+| `cargo audit --file Cargo.lock` | 182 locked dependencies, 0 vulnerabilities (1 allowed yanked advisory) |
 
-新增与更新测试重点：
-- `multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai`：第 1 步验证 `Gemini -> Gemini` 同方言直通（保留原始键名 `"a_damaged"`、`"b_route"`、`"c_level"` 与 `"a_support"`、`"b_sales"`，无 `usage.decora`）；第 2 步验证 Gemini 503 自动回退至 OpenAI 后端并切换为跨方言转换（含 `usage.decora.provider == "openai"`）。
-- `same_dialect_passthrough_preserves_native_keys_and_works_under_strict_usage`：验证 `/v0/decisions -> typesafe`、`/api/v1/decisions -> openrouter`（保留原生 `usage.cost` 与中文键名，无 `usage.decora`）以及 `/v1beta/decisions -> gemini` 在 `usage_policy: strict` 下全部直通成功；同时验证跨方言非 OpenAI 路由在 `strict` 下仍返回 `400 unsupported_usage`，以及直通模式下非法概率、篡改 `legend` 与非法 `usage` 均被拦截为 `502 upstream_protocol_error` 且不回退。
+Key integration test highlights:
+- `multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai`: verifies `Gemini -> Gemini` passthrough (preserving native keys `"a_damaged"`, `"b_route"`, `"c_level"` and `"a_support"`, `"b_sales"`, with no `usage.decora`), followed by automatic fallback on Gemini `503` to OpenAI with cross-dialect translation (`usage.decora.provider == "openai"`).
+- `same_dialect_passthrough_preserves_native_keys_and_works_under_strict_usage`: verifies `/v0/decisions -> typesafe`, `/api/v1/decisions -> openrouter` (preserving native `usage.cost` and Unicode keys without `usage.decora`), and `/v1beta/decisions -> gemini` under `usage_policy: strict`; also verifies that cross-dialect non-OpenAI routes still return `400 unsupported_usage` under `strict`, and that invalid probabilities, tampered `legend`, and invalid `usage` in passthrough mode are rejected as `502 upstream_protocol_error` without fallback.
 
-## 文件与安全交付
-- `src/adapter.rs`、`src/dialect.rs`、`src/gateway.rs`：同方言直通与异构回退切换逻辑。
-- `tests/offline.rs`：更新 Gemini 直通与跨方言回退测试，新增同方言直通与 `strict` 模式测试（总数增至 43 项）。
-- `README.md`、`docs/PROTOCOL.md`、`HANDOFF.md`、`.kiro/specs/dialect-passthrough/tasks.md`：文档与 Spec 清单全部同步更新并勾选 `[x]`。
+## Delivered Files
+- `src/adapter.rs`, `src/dialect.rs`, `src/gateway.rs`: same-dialect passthrough and per-attempt cross-dialect fallback.
+- `tests/offline.rs`: full 43-test offline verification suite.
+- `demo/`: reproducible loopback mock and optional real-API proof (`run.sh`, `mock.py`, `capture.sh`, `capture.py`, `table.jq`, `README.md`).
+- `README.md`, `docs/PROTOCOL.md`, `HANDOFF.md`, `config.example.yaml`, `.kiro/`: synchronized English documentation, steering rules, specs, and hooks.
 
-## 后续仍需
-1. 主会话推送本轮本地提交。
-2. 用户授权后做最小真实账户调用，核对各官方端点模型权限、响应与账单；本项目只做了离线 loopback mock 验证，没有花费真实 API 额度。
-3. 公网仍需 TLS 反代、防火墙、限流与进程守护。
+## Production Follow-Ups
+1. Verify live account entitlements and billing for TypeSafe and OpenRouter (OpenAI `gpt-6-luna` and Gemini `gemini-decision-1` have been verified live via `DEMO_REAL=1 bash demo/capture.sh`).
+2. For public deployments, run behind a TLS reverse proxy with firewalling, rate limiting, and process supervision.

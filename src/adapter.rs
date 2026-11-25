@@ -1,4 +1,4 @@
-//! 官方原生协议映射：默认保留真实可用 usage；严格模式拒绝口径或必需明细差异。
+//! Official native protocol mapping: preserve genuinely available usage by default; strict mode rejects differences in counting basis or required details.
 use crate::{
     config::{Backend, BackendKind, UsagePolicy},
     dialect::Dialect,
@@ -10,7 +10,7 @@ use crate::{
 };
 use serde_json::{Map, Value, json};
 
-/// 检查管理员声明和 adapter 固有边界；默认按 OpenAI 入站方言评估。
+/// Check administrator declarations and adapter-specific limits; evaluate using the OpenAI inbound dialect by default.
 pub fn compatible(
     backend: &Backend,
     req: &DecisionRequest,
@@ -20,7 +20,7 @@ pub fn compatible(
     compatible_for_dialect(Dialect::Openai, backend, req, need, usage_policy)
 }
 
-/// 按入站方言检查候选后端能力边界；同方言原生直通在 strict usage 下同样放行。
+/// Check candidate backend capability boundaries for the inbound dialect; same-dialect native passthrough is also allowed under strict usage.
 pub fn compatible_for_dialect(
     dialect: Dialect,
     backend: &Backend,
@@ -57,7 +57,7 @@ fn parts_have_images(value: &Value) -> bool {
         .is_some_and(|parts| parts.iter().any(|p| p["type"] == "input_image"))
 }
 fn validate_native_request(req: &DecisionRequest) -> Result<(), ApiError> {
-    // 只检查真正的内容 part，不把 input_json.data 中同名字段当图片。
+    // Check only actual content parts; do not treat fields with matching names in input_json.data as images.
     let images = req
         .input
         .as_array()
@@ -94,7 +94,7 @@ fn choice_key_for(choices: &[ChoiceOption], index: usize, kind: BackendKind) -> 
             .iter()
             .any(|c| matches!(c.value, ChoiceValue::Bool(_)))
     {
-        // Gemini 或含布尔选项组统一重命名，避免非 ASCII/空串限制及同名字符串碰撞。
+        // Rename all choices for Gemini or groups containing boolean choices to avoid non-ASCII/empty-string restrictions and string-key collisions.
         format!("decora_choice_{index}")
     } else {
         let ChoiceValue::String(s) = &choices[index].value else {
@@ -123,17 +123,17 @@ fn textual(value: &Value, kind: &str) -> Value {
     if value.is_string() {
         return value.clone();
     }
-    // JSON 转义明确 data 边界，但不声称能阻止模型层 prompt injection。
+    // JSON escaping makes the data boundary explicit but does not claim to prevent model-level prompt injection.
     json!(
         json!({"decora_encoding":"openai_decisions_text_v1","kind":kind,"data":value}).to_string()
     )
 }
-/// 自动将标准中间请求转换为上游原生 body；转换是网关内部实现，不是客户端 API。
+/// Automatically convert a canonical intermediate request to the upstream's native body; this conversion is an internal gateway implementation, not a client API.
 pub fn native_body(req: &DecisionRequest, model: &str) -> Result<Value, ApiError> {
     native_body_for(req, model, BackendKind::Openrouter)
 }
 
-/// 按提供方原生协议构造请求体。
+/// Build a request body using the provider's native protocol.
 pub fn native_body_for(
     req: &DecisionRequest,
     model: &str,
@@ -182,7 +182,7 @@ pub fn native_body_for(
                 );
             }
         }
-        // 公开名称可重复、可省略；内部键稳定且无碰撞，原名称只在最终答案还原。
+        // Public names may be repeated or omitted; internal keys are stable and collision-free, and original names are restored only in the final answers.
         questions.insert(format!("q{index}"), question);
     }
     let mut root = json!({
@@ -198,12 +198,12 @@ pub fn native_body_for(
     Ok(root)
 }
 
-/// 将 native 答案重排并转换为标准中间答案形状；概率及 confidence 原样保留。
+/// Reorder native answers and convert them to the canonical intermediate answer shape; preserve probabilities and confidence unchanged.
 pub fn native_answers(value: &Value, req: &DecisionRequest) -> Result<Vec<Answer>, ApiError> {
     native_answers_for(value, req, BackendKind::Openrouter)
 }
 
-/// 按后端种类重排并转换答案。
+/// Reorder and convert answers according to the backend kind.
 pub fn native_answers_for(
     value: &Value,
     req: &DecisionRequest,
@@ -304,8 +304,8 @@ fn token_i32(source: &Map<String, Value>, key: &str) -> Result<i32, ApiError> {
         .ok_or_else(ApiError::protocol)
 }
 
-/// 将官方原生响应转换为核心答案及透明的 usage 兼容扩展。
-/// input/output 直接来自上游；total 是显式标记口径的两数之和，未知明细不补零。
+/// Convert an official native response to core answers and a transparent usage compatibility extension.
+/// input/output come directly from the upstream; total is their sum under an explicitly marked basis, and unknown details are not filled with zeros.
 pub fn native_response(
     value: Value,
     req: &DecisionRequest,

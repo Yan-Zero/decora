@@ -1,4 +1,4 @@
-//! 全部测试只连接临时 loopback mock；不读取真实凭据，不调用公共 API。
+//! All tests connect only to temporary loopback mocks; they do not read real credentials or call public APIs.
 use axum::{
     Json, Router,
     extract::State,
@@ -574,7 +574,7 @@ fn official_native_schema_mapping_is_not_chat_completion_or_fabricated_usage() {
     assert_eq!(serialized[0]["name"], "same");
     assert_eq!(serialized[0]["probability"], 0.9);
     assert_eq!(serialized[2]["probabilities"][1]["label"], "high");
-    // 测试借助独立、已知的完整 usage 检验答案；native usage 本身确实不能通过合同。
+    // The test validates answers using separate, known-complete usage; native usage itself does not satisfy the contract.
     assert!(
         DecisionResponse::parse(
             json!({"model":"jev","answers":serialized,"usage":usage()}),
@@ -738,7 +738,7 @@ async fn concurrent_requests_have_an_explicit_capacity_limit() {
     let gw = gateway(cfg);
     let first_gw = gw.clone();
     let first = tokio::spawn(async move { call(&first_gw, predicate()).await });
-    // 等待 mock 明确收到请求，而不是假定任务调度顺序。
+    // Wait until the mock has explicitly received the request instead of assuming task scheduling order.
     tokio::time::timeout(Duration::from_secs(1), async {
         while upstream.count() == 0 {
             tokio::task::yield_now().await;
@@ -836,7 +836,7 @@ async fn native_http_three_types_work_by_default_with_honest_partial_usage() {
         }
         let upstream = Mock::at(path, vec![Reply::ok(response)]).await;
         let cfg = config_value(json!({"native":native_backend(&upstream.url,kind,0)}));
-        assert!(cfg.get("usage_policy").is_none()); // 真正测试默认 compatible，而不是显式解锁。
+        assert!(cfg.get("usage_policy").is_none()); // This genuinely tests the default compatible mode rather than explicitly enabling it.
         let (s, _, v) = call(&gateway(cfg), native_request_three()).await;
         assert_eq!(s, StatusCode::OK, "{kind}: {v}");
         assert_eq!(v["model"], "decora-test");
@@ -1050,7 +1050,7 @@ async fn native_available_detail_values_are_preserved_without_claiming_equal_tok
         if kind == "typesafe" {
             assert_eq!(v["usage"]["decora"]["input_tokens_basis"], "billable_input");
         }
-        assert!(DecisionResponse::parse(v, &parse(native_request_three())).is_err()); // 完整细分也不把不同口径误当 strict。
+        assert!(DecisionResponse::parse(v, &parse(native_request_three())).is_err()); // Complete details still do not make different counting bases equivalent under strict mode.
     }
 }
 
@@ -1326,7 +1326,7 @@ async fn identical_openai_request_and_answers_contract_for_every_backend_alias()
         );
         assert!(v.get("state").is_none());
         assert!(v.get("native_input_policy").is_none());
-        // 本轮只统一请求与核心 answers；兼容 usage 扩展仍是明确保留的合同差异。
+        // This test unifies only the request and core answers; the compatible usage extension remains an intentional contract difference.
         if kind == "openai" {
             assert!(v["usage"].get("decora").is_none());
         } else if kind == "gemini" {
@@ -1367,7 +1367,7 @@ async fn identical_openai_request_and_answers_contract_for_every_backend_alias()
                 }
             }
         }
-        // 上游专有请求形状不成为额外公开 API；转换设置也不能由客户端传入。
+        // Upstream-specific request shapes do not become additional public APIs; clients cannot provide conversion settings either.
         for invalid in [
             json!({"model":"decora-test","state":"x","questions":{"q0":{"type":"noul","instructions":"q"}}}),
             {
@@ -1786,7 +1786,7 @@ async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai(
         }
     });
 
-    // 1) 直连 Gemini 后端（同方言原生直通），使用 x-goog-api-key 入站鉴权
+    // 1) Connect directly to the Gemini backend (same-dialect native passthrough), authenticating inbound requests with x-goog-api-key.
     let gemini_upstream_resp = json!({
         "answers": {
             "a_damaged": {"type": "noul", "noul": 0.9},
@@ -1859,7 +1859,7 @@ async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai(
         );
     }
 
-    // 2) Gemini 上游 503 回退至 OpenAI 后端，仍按 Gemini 响应格式返回且标明 provider: openai
+    // 2) Fall back from a Gemini upstream 503 to the OpenAI backend, returning Gemini response format and marking provider: openai.
     let openai_resp = json!({
         "model": "gpt-6-luna",
         "answers": [
@@ -1899,7 +1899,7 @@ async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai(
     );
     assert_eq!(v["usage"]["decora"]["details_complete"], true);
 
-    // 3) Gemini inline_data 图片数组入站路由至 OpenAI 视觉后端，并先排除非视觉后端
+    // 3) Route an inbound Gemini inline_data image array to an OpenAI vision backend, filtering out non-vision backends first.
     let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
     let img_req = json!({
         "model": "decora-test",
@@ -1947,7 +1947,7 @@ async fn multi_dialect_gemini_inbound_routes_to_gemini_and_falls_back_to_openai(
         );
     }
 
-    // 若只有非视觉后端，则拒绝而不触达网络
+    // If only non-vision backends are available, reject the request without contacting the network.
     let gw_only_non_vision = gateway(config_value(json!({
         "gem_only": native_backend(&gem_503.url, "gemini", 0),
     })));
@@ -1981,7 +1981,7 @@ async fn multi_dialect_typesafe_and_openrouter_inbound_with_chinese_and_score_de
         }
     });
 
-    // 1) TypeSafe /v0/decisions -> Gemini 后端（Gemini 内部映射再由 dialect 还原中文选项与 score legend 对象）
+    // 1) TypeSafe /v0/decisions -> Gemini backend (Gemini mapping is reversed by the dialect layer to restore Chinese choices and score legend objects).
     let gem_resp = json!({
         "answers": {
             "q0": {
@@ -2034,7 +2034,7 @@ async fn multi_dialect_typesafe_and_openrouter_inbound_with_chinese_and_score_de
     assert_eq!(v["usage"]["total_tokens"], 60);
     assert_eq!(v["usage"]["decora"]["provider"], "gemini");
 
-    // 2) OpenRouter /api/v1/decisions -> OpenAI 后端
+    // 2) OpenRouter /api/v1/decisions -> OpenAI backend.
     let oa_resp = json!({
         "model": "gpt-6-luna",
         "answers": [
@@ -2085,7 +2085,7 @@ async fn strict_dialect_boundaries_and_dual_auth_conflict_rejections() {
     let upstream = Mock::new(vec![]).await;
     let gw = gateway(config_value(json!({"oa": backend(&upstream.url, 0)})));
 
-    // 1) 向 /v1/decisions 发送 state 或对象 questions -> 400 invalid_request
+    // 1) Send state or object-form questions to /v1/decisions -> 400 invalid_request.
     for body in [
         json!({"model": "decora-test", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
         json!({"model": "decora-test", "input": "x", "questions": {"q0": {"type": "predicate", "instructions": "q"}}}),
@@ -2101,7 +2101,7 @@ async fn strict_dialect_boundaries_and_dual_auth_conflict_rejections() {
         assert_eq!(v["error"]["code"], "invalid_request");
     }
 
-    // 2) 向 /v1beta/decisions 发送 state、数组 questions 或 predicate -> 400 invalid_request
+    // 2) Send state, array-form questions, or predicate to /v1beta/decisions -> 400 invalid_request.
     for body in [
         json!({"model": "decora-test", "state": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
         json!({"model": "decora-test", "input": "x", "questions": [{"type": "predicate", "instructions": "q"}]}),
@@ -2118,7 +2118,7 @@ async fn strict_dialect_boundaries_and_dual_auth_conflict_rejections() {
         assert_eq!(v["error"]["code"], "invalid_request");
     }
 
-    // 3) 向 /v0/decisions 与 /api/v1/decisions 发送 input 或数组 questions -> 400 invalid_request
+    // 3) Send input or array-form questions to /v0/decisions and /api/v1/decisions -> 400 invalid_request.
     for path in ["/v0/decisions", "/api/v1/decisions"] {
         for body in [
             json!({"model": "decora-test", "input": "x", "questions": {"q0": {"type": "noul", "instructions": "q"}}}),
@@ -2136,7 +2136,7 @@ async fn strict_dialect_boundaries_and_dual_auth_conflict_rejections() {
         }
     }
 
-    // 4) 同时发送 Authorization 与 x-goog-api-key（或重复头） -> 401 invalid_api_key
+    // 4) Send both Authorization and x-goog-api-key (or duplicate headers) -> 401 invalid_api_key.
     for path in [
         "/v1/decisions",
         "/v1beta/decisions",
@@ -2231,7 +2231,7 @@ async fn same_dialect_passthrough_preserves_native_keys_and_works_under_strict_u
         }
     });
 
-    // 1) /v0/decisions -> typesafe 与 /api/v1/decisions -> openrouter 同方言直通
+    // 1) Same-dialect passthrough: /v0/decisions -> typesafe and /api/v1/decisions -> openrouter.
     for (path, kind, upstream_path) in [
         ("/v0/decisions", "typesafe", "/v1/systemone"),
         ("/api/v1/decisions", "openrouter", "/api/alpha/decisions"),
@@ -2298,7 +2298,7 @@ async fn same_dialect_passthrough_preserves_native_keys_and_works_under_strict_u
         }
     }
 
-    // 2) /v1beta/decisions -> gemini 在 usage_policy: strict 下同样正常直通
+    // 2) /v1beta/decisions -> gemini also passes through normally with usage_policy: strict.
     let gem_req = json!({
         "model": "decora-test",
         "input": "测试严格模式直通",
@@ -2329,7 +2329,7 @@ async fn same_dialect_passthrough_preserves_native_keys_and_works_under_strict_u
     assert!(v["usage"].get("decora").is_none());
     assert_eq!(v["usage"], gem_resp["usage"]);
 
-    // 3) strict 下跨方言非 OpenAI 路由（/v1/decisions -> gemini，/v1beta/decisions -> typesafe）仍返回 400 unsupported_usage
+    // 3) Under strict mode, cross-dialect routing to non-OpenAI backends (/v1/decisions -> gemini, /v1beta/decisions -> typesafe) still returns 400 unsupported_usage.
     let no_hit = Mock::new(vec![]).await;
     let mut strict_gem_cfg = config_value(json!({"gem": native_backend(&no_hit.url, "gemini", 0)}));
     strict_gem_cfg["usage_policy"] = json!("strict");
@@ -2350,7 +2350,7 @@ async fn same_dialect_passthrough_preserves_native_keys_and_works_under_strict_u
     assert_eq!(v["error"]["code"], "unsupported_usage");
     assert_eq!(no_hit.count(), 0);
 
-    // 4) 直通模式依然严格拦截非法概率、篡改 legend 与非法 usage，返回 502 upstream_protocol_error 且不回退
+    // 4) Passthrough mode still strictly rejects invalid probabilities, altered legends, and invalid usage, returning 502 upstream_protocol_error without fallback.
     let bad_prob = json!({
         "model": "jev-latest",
         "answers": {

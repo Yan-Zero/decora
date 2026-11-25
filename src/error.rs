@@ -1,4 +1,4 @@
-//! 只对外返回固定说明，绝不回显上游响应、URL、凭据或用户输入。
+//! Return only fixed public messages; never echo upstream responses, URLs, credentials, or user input.
 use axum::{
     Json,
     http::StatusCode,
@@ -6,7 +6,7 @@ use axum::{
 };
 use serde_json::json;
 
-/// OpenAI 风格错误封装；message 必须是程序内固定字符串。
+/// OpenAI-style error wrapper; message must be a fixed string defined in the program.
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
@@ -15,7 +15,7 @@ pub struct ApiError {
     pub retry_after: Option<u64>,
 }
 impl ApiError {
-    /// 构造不包含敏感信息的错误。
+    /// Construct an error that contains no sensitive information.
     pub fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
         Self {
             status,
@@ -24,7 +24,7 @@ impl ApiError {
             retry_after: None,
         }
     }
-    /// 请求格式或字段范围错误。
+    /// The request format is invalid or a field is out of range.
     pub fn invalid() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -32,7 +32,7 @@ impl ApiError {
             "Request fields, types or ranges do not match the Decisions protocol.",
         )
     }
-    /// 协议存在该能力，但当前网关或候选不能无损支持。
+    /// The protocol defines this capability, but the gateway or any candidate cannot support it losslessly.
     pub fn unsupported(code: &'static str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -40,7 +40,7 @@ impl ApiError {
             "No configured upstream can serve this request losslessly; see the capability matrix.",
         )
     }
-    /// 上游响应违反合同；不重试或切换模型。
+    /// The upstream response violated the contract; do not retry or switch models.
     pub fn protocol() -> Self {
         Self::new(
             StatusCode::BAD_GATEWAY,

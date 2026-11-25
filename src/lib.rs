@@ -1,4 +1,4 @@
-//! Decora：保留原生决策概率、严格检查能力边界的多方言单租户网关。
+//! Decora: a multi-dialect, single-tenant gateway that preserves native decision probabilities and strictly enforces capability boundaries.
 pub mod adapter;
 pub mod config;
 pub mod dialect;
