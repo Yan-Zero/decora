@@ -1,11 +1,65 @@
 # Decora
 
+> **Four dialects. One contract. Zero phantoms.**
+
+[![Rust 2024](https://img.shields.io/badge/Rust-2024%20Edition-orange?logo=rust)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Tests: 43 Passing](https://img.shields.io/badge/Offline%20Tests-43%20Passing-brightgreen)](#offline-verification--reproducible-demo)
+[![Security Audit](https://img.shields.io/badge/Cargo%20Audit-0%20Vulnerabilities-blue)](#offline-verification--reproducible-demo)
+[![WASM Demo](https://img.shields.io/badge/Demo-Live%20WASM%20Protocol%20Converter-e5a93c)](#live-wasm-protocol-converter-demo)
+
 **Decora is a standalone, single-tenant multi-dialect Decisions protocol gateway written in Rust.** Every public model alias is served across all four official inbound endpoint dialects (plus `GET /healthz`) using a symmetric **Hub-and-Spoke architecture (`Dialect ↔ Canonical Decision IR ↔ Adapter`)**, allowing SDKs and clients from different ecosystems to route and fail over across any compatible native upstream without rewriting requests:
 
-- `POST /v1/decisions`: OpenAI Decisions dialect (`model / input / questions[]`, question types `predicate / choice / score`)
-- `POST /v1beta/decisions`: Google Gemini Decisions dialect (`model / input / questions{}`, question types `noul / choice / score`, supporting plain text and `text / inline_data` multimodal arrays)
-- `POST /v0/decisions`: TypeSafe (Jev) Decisions dialect (`model / state / questions{}`, question types `noul / choice / score`)
-- `POST /api/v1/decisions`: OpenRouter Decisions dialect (`model / state / questions{}`, question types `noul / choice / score`)
+```text
+  POST /v1/decisions       (OpenAI)     ──┐
+  POST /v1beta/decisions   (Gemini)     ──┼─► Dialect::parse_request ──► Canonical Decision IR
+  POST /v0/decisions       (TypeSafe)   ──┤                                       │
+  POST /api/v1/decisions   (OpenRouter) ──┘                                       ▼
+                                                                Per-Attempt Routing & Fallback
+                                                           ┌──────────────────────┴──────────────────────┐
+                                                           ▼                                             ▼
+                                              Same-Dialect Passthrough                       Cross-Dialect Translation
+                                         (native keys & usage preserved,                 (Adapter ↔ Canonical IR, honest
+                                          math verified, no usage.decora)                  usage.decora provenance)
+```
+
+| Inbound Endpoint | Official Dialect | Request Shape | Question Types |
+|---|---|---|---|
+| `POST /v1/decisions` | **OpenAI Decisions** | `model / input / questions[]` | `predicate` · `choice` · `score` |
+| `POST /v1beta/decisions` | **Google Gemini Decisions** | `model / input / questions{}` (text & `inline_data`) | `noul` · `choice` · `score` |
+| `POST /v0/decisions` | **TypeSafe (Jev) Decisions** | `model / state / questions{}` | `noul` · `choice` · `score` |
+| `POST /api/v1/decisions` | **OpenRouter Decisions** | `model / state / questions{}` | `noul` · `choice` · `score` |
+
+### Why Decora?
+
+- **Zero Phantom Probabilities**: Every upstream response is mathematically verified before reaching your client (`|Σp − 1| ≤ 1e-4`, `S = Σ i·p_i`, finite `[0, 1]`, exact option & `score.legend` coverage). Violations return `502 upstream_protocol_error` with zero retries and zero silent normalization.
+- **No Chat-Completion Workarounds**: Decora speaks only native single-pass Decisions APIs and never falls back to chat completions to fabricate probabilities.
+- **Per-Attempt Same-Dialect Passthrough & Cross-Dialect Failover**: Matching inbound/outbound dialects run in zero-pollution passthrough mode; if a primary fails with `429`/`5xx`/timeout, the next attempt automatically switches to Canonical IR translation for a heterogeneous backup.
+- **Honest Usage Provenance**: Under default `usage_policy: compatible`, Decora preserves verified upstream counts, omits unknown breakdowns (never zero-filling), and tags accounting provenance in `usage.decora`. Operators needing strict native schemas can set `usage_policy: strict`.
+
+---
+
+## Live WASM Protocol Converter Demo
+
+Decora’s core Rust protocol engine (`src/protocol.rs`, `src/dialect.rs`, `src/adapter.rs`) compiles directly to WebAssembly (`wasm32-unknown-unknown`, ~525 KB) with zero external JS frameworks or API keys required.
+
+- **Static bundle**: [`playground/`](playground/) (ready for zero-config static hosting on Cloudflare Pages — see [`playground/README.md`](playground/README.md))
+- **WASM crate**: [`wasm/`](wasm/) (`decora` with `default-features = false`)
+- **What you can test interactively in the browser**:
+  1. **Cross-Dialect Translation**: Send one OpenAI request (roles + `input_json` + mixed `true` / `"true"` / `"售后"` choices + `score`) and inspect the exact Gemini / TypeSafe / OpenRouter wire payload and `usage.decora` provenance.
+  2. **Same-Dialect Passthrough**: Route Gemini → Gemini under `usage_policy: strict` with native keys preserved and zero `usage.decora` injection.
+  3. **503 Failover Switch**: Simulate a primary `503` and watch per-attempt switching from passthrough to Canonical IR backup.
+  4. **Phantom Probability Rejection (`HTTP 502`)**: Inject or hand-edit broken probabilities (`Σp = 0.93`) in the simulated upstream response and watch the Rust WASM verifier reject them immediately.
+  5. **Strict Dialect Schema Guard (`HTTP 400`)** and **`input_json.image_url` vs. real `input_image` / `strict` usage**.
+
+Run the WASM playground locally in one line:
+
+```bash
+python -m http.server 8080 --directory playground
+# Open http://127.0.0.1:8080
+```
+
+---
 
 Each inbound endpoint strictly validates its official dialect schema (for example, sending `state` to `/v1/decisions` or sending an array `questions` to `/v0/decisions` returns `400 invalid_request`), with no client-side "conversion strategy" flags. Protocol translation between OpenAI, Gemini, OpenRouter, and TypeSafe/Jev happens automatically inside the gateway—never via chat completions and never by fabricating probabilities.
 
@@ -248,6 +302,7 @@ The integration test suite binds loopback TCP mocks on ephemeral ports without r
 - `src/adapter.rs`: Capability filtering and native upstream protocol adapters; `src/gateway.rs`: HTTP routing, dual-header auth, fallback, and retry budgets.
 - `tests/offline.rs`: Offline integration test suite; `docs/PROTOCOL.md`: Official references, Hub-and-Spoke architecture, and capability matrix.
 - `demo/`: Reproducible loopback mock and optional real-API demo scripts (`demo/run.sh`, `demo/mock.py`, `demo/README.md`).
+- `wasm/` & `playground/`: WebAssembly bindings (`wasm32-unknown-unknown`) and static Live WASM Protocol Converter Demo ready for Cloudflare Pages.
 - `.kiro/`: Kiro steering documents, feature specs (`requirements.md` / `design.md` / `tasks.md`), and agent hooks.
 - `HANDOFF.md`: Implementation history, verification results, and handoff notes.
 

@@ -144,7 +144,7 @@ fn image_url(v: &Value) -> Result<(), ApiError> {
             return Err(ApiError::invalid());
         }
     } else {
-        let url = reqwest::Url::parse(s).map_err(|_| ApiError::invalid())?;
+        let url = url::Url::parse(s).map_err(|_| ApiError::invalid())?;
         if !["https", "http"].contains(&url.scheme())
             || url.host_str().is_none()
             || !url.username().is_empty()

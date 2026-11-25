@@ -4,7 +4,7 @@ use crate::{
     error::ApiError,
     protocol::{Answer, ChoiceValue, DecisionRequest, DecisionResponse, Question, Requirements},
 };
-use axum::http::StatusCode;
+use http::StatusCode;
 use serde_json::{Map, Value, json};
 
 /// Supported inbound Decisions protocol dialects.

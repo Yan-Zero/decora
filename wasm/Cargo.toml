@@ -1,0 +1,20 @@
+[package]
+name = "decora-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "WebAssembly bindings exposing Decora's real Rust protocol engine for the browser Live WASM Protocol Converter Demo"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+decora = { path = "..", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

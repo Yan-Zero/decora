@@ -1,10 +1,11 @@
 //! Return only fixed public messages; never echo upstream responses, URLs, credentials, or user input.
+#[cfg(feature = "server")]
 use axum::{
     Json,
-    http::StatusCode,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use http::StatusCode;
+use serde_json::{Value, json};
 
 /// OpenAI-style error wrapper; message must be a fixed string defined in the program.
 #[derive(Debug, Clone)]
@@ -48,9 +49,8 @@ impl ApiError {
             "Upstream response violated the verified protocol.",
         )
     }
-}
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+    /// Serialize the fixed public error envelope shared by HTTP responses and WASM bindings.
+    pub fn error_body(&self) -> Value {
         let kind = if self.status == StatusCode::UNAUTHORIZED {
             "authentication_error"
         } else if self.status.is_client_error() {
@@ -58,7 +58,14 @@ impl IntoResponse for ApiError {
         } else {
             "api_error"
         };
-        let mut response = (self.status, Json(json!({"error": {"message": self.message, "type": kind, "param": null, "code": self.code}}))).into_response();
+        json!({"error": {"message": self.message, "type": kind, "param": null, "code": self.code}})
+    }
+}
+#[cfg(feature = "server")]
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = self.error_body();
+        let mut response = (self.status, Json(body)).into_response();
         if let Some(seconds) = self.retry_after {
             response.headers_mut().insert(
                 "retry-after",

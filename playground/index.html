@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Decora — Live WASM Protocol Converter Demo</title>
+  <meta name="description" content="Interactive WebAssembly demo running the real Decora Rust Decisions protocol engine (OpenAI, Google Gemini, TypeSafe/Jev, OpenRouter) 100% client-side in your browser." />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">D</span>
+        <div>
+          <div class="brand-title-row">
+            <h1>DECORA</h1>
+            <span class="demo-pill">LIVE WASM PROTOCOL CONVERTER DEMO</span>
+          </div>
+          <p class="brand-sub">Four dialects. One contract. Zero phantoms.</p>
+        </div>
+      </div>
+
+      <div class="topbar-meta">
+        <div id="wasmStatus" class="status-chip status-loading">
+          <span class="dot"></span>
+          <span>Loading Rust WASM core…</span>
+        </div>
+        <a class="repo-link" href="https://github.com/Yan-Zero/decora" target="_blank" rel="noopener noreferrer">
+          GitHub Repository ↗
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="hero-card">
+      <div class="hero-copy">
+        <p class="eyebrow">REAL RUST ENGINE IN WEBASSEMBLY · NO API KEYS REQUIRED</p>
+        <h2>Test Decora’s Hub-and-Spoke Decisions Protocol Engine Live in Your Browser</h2>
+        <p class="hero-desc">
+          This interactive playground runs the <strong>actual Decora Rust core</strong>
+          (<code>src/protocol.rs</code>, <code>src/dialect.rs</code>, <code>src/adapter.rs</code>)
+          compiled to <code>wasm32-unknown-unknown</code> directly inside your browser against schema-accurate mock upstream fixtures.
+          Switch inbound dialects, inspect exact wire translations, simulate 503 cross-dialect failover, or tamper with upstream probabilities to watch the verifier reject phantoms with <code>HTTP 502</code>.
+        </p>
+      </div>
+      <div class="hero-stats">
+        <div class="stat-box">
+          <span class="stat-label">Dialects ↔ Adapters</span>
+          <span class="stat-value">4 × 4 Hub-and-Spoke</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-label">Math Tolerance</span>
+          <span class="stat-value">|Σp − 1| ≤ 10⁻⁴</span>
+        </div>
+        <div class="stat-box">
+          <span class="stat-label">Execution Mode</span>
+          <span class="stat-value">100% Client-Side WASM</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="presets-bar" aria-label="Interactive Judge Scenarios">
+      <div class="section-head">
+        <span class="section-kicker">ONE-CLICK SCENARIOS</span>
+        <span class="section-hint">Click any scenario to load it and execute through the Rust WASM engine immediately</span>
+      </div>
+      <div class="preset-grid" id="presetGrid"></div>
+    </section>
+
+    <section class="controls-card" aria-label="Routing & Policy Controls">
+      <div class="control-group">
+        <label for="dialectSelect">Inbound Dialect Endpoint</label>
+        <div class="segmented" id="dialectButtons" role="group" aria-label="Inbound Dialect">
+          <button type="button" data-dialect="openai" class="seg-btn active">
+            <span class="badge-dot dot-openai"></span>
+            OpenAI <code>/v1/decisions</code>
+          </button>
+          <button type="button" data-dialect="gemini" class="seg-btn">
+            <span class="badge-dot dot-gemini"></span>
+            Gemini <code>/v1beta/decisions</code>
+          </button>
+          <button type="button" data-dialect="typesafe" class="seg-btn">
+            <span class="badge-dot dot-typesafe"></span>
+            TypeSafe <code>/v0/decisions</code>
+          </button>
+          <button type="button" data-dialect="openrouter" class="seg-btn">
+            <span class="badge-dot dot-openrouter"></span>
+            OpenRouter <code>/api/v1/decisions</code>
+          </button>
+        </div>
+      </div>
+
+      <div class="control-row">
+        <div class="control-field">
+          <label for="targetSelect">Target Upstream Backend</label>
+          <select id="targetSelect">
+            <option value="openai">OpenAI Native (gpt-6-luna)</option>
+            <option value="gemini" selected>Google Gemini Native (gemini-decision-1)</option>
+            <option value="typesafe">TypeSafe / Jev Native (jev-latest)</option>
+            <option value="openrouter">OpenRouter Alpha (typesafe/jev-1.13)</option>
+          </select>
+        </div>
+
+        <div class="control-field">
+          <label for="usagePolicySelect">Server <code>usage_policy</code></label>
+          <select id="usagePolicySelect">
+            <option value="compatible" selected>compatible (honest provenance via usage.decora)</option>
+            <option value="strict">strict (native exact usage or same-dialect passthrough only)</option>
+          </select>
+        </div>
+
+        <div class="control-field failover-field">
+          <label class="toggle-label">
+            <input type="checkbox" id="failoverToggle" />
+            <span>Simulate Primary <code>503</code> Failover → Backup</span>
+          </label>
+          <select id="backupSelect" disabled>
+            <option value="openai">Backup: OpenAI (gpt-6-luna)</option>
+            <option value="gemini">Backup: Gemini (gemini-decision-1)</option>
+            <option value="typesafe" selected>Backup: TypeSafe (jev-latest)</option>
+            <option value="openrouter">Backup: OpenRouter (typesafe/jev-1.13)</option>
+          </select>
+        </div>
+
+        <div class="control-actions">
+          <button type="button" id="runBtn" class="btn-primary">Run WASM Engine ▶</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="workbench">
+      <!-- Column 1: Inbound Request -->
+      <article class="panel">
+        <header class="panel-head">
+          <div>
+            <span class="step-num">01</span>
+            <h3>Inbound Client Request</h3>
+          </div>
+          <div class="panel-actions">
+            <button type="button" id="formatReqBtn" class="btn-ghost">Format</button>
+            <button type="button" id="copyReqBtn" class="btn-ghost">Copy</button>
+          </div>
+        </header>
+        <div class="meta-strip" id="inboundMeta">
+          <span class="mono-tag" id="inboundEndpointTag">POST /v1/decisions</span>
+          <span class="muted-note" id="scenarioNote"></span>
+        </div>
+        <textarea id="requestEditor" class="code-editor" spellcheck="false" aria-label="Inbound JSON Request"></textarea>
+      </article>
+
+      <!-- Column 2: Decora Rust Core + Wire & Mock Upstream -->
+      <article class="panel">
+        <header class="panel-head">
+          <div>
+            <span class="step-num">02</span>
+            <h3>Decora Wire &amp; Upstream Fixture</h3>
+          </div>
+          <span id="modeBadge" class="mode-badge mode-ir">CROSS-DIALECT IR</span>
+        </header>
+
+        <div id="failoverTimeline" class="failover-timeline hidden"></div>
+
+        <div class="meta-strip" id="irSummaryStrip"></div>
+
+        <div class="subpanel">
+          <div class="subpanel-head">
+            <span class="subpanel-title">Outbound Upstream Request (Generated by Rust WASM)</span>
+            <button type="button" id="copyWireBtn" class="btn-ghost">Copy</button>
+          </div>
+          <div class="wire-headers" id="wireHeaders"></div>
+          <pre id="wireOutput" class="code-view"></pre>
+        </div>
+
+        <div class="subpanel">
+          <div class="subpanel-head">
+            <span class="subpanel-title">Simulated Upstream Response (Editable — Tamper to Test!)</span>
+            <div class="panel-actions">
+              <button type="button" id="injectPhantomBtn" class="btn-danger-ghost" title="Subtract 0.07 from a probability so Σp = 0.93">Inject Phantom (Σp=0.93)</button>
+              <button type="button" id="reverifyBtn" class="btn-accent-ghost">Re-Verify ▶</button>
+            </div>
+          </div>
+          <textarea id="upstreamEditor" class="code-editor code-editor-sm" spellcheck="false" aria-label="Editable Simulated Upstream Response"></textarea>
+        </div>
+      </article>
+
+      <!-- Column 3: Verified Client Response -->
+      <article class="panel">
+        <header class="panel-head">
+          <div>
+            <span class="step-num">03</span>
+            <h3>Verified Client Response</h3>
+          </div>
+          <div class="panel-actions">
+            <span id="httpStatusPill" class="http-pill http-200">HTTP 200 OK</span>
+            <button type="button" id="copyRespBtn" class="btn-ghost">Copy</button>
+          </div>
+        </header>
+
+        <div id="ledgerBox" class="ledger-box"></div>
+
+        <pre id="responseOutput" class="code-view code-view-tall"></pre>
+      </article>
+    </section>
+
+    <section class="cli-card">
+      <div class="cli-head">
+        <h3>Run the Full Native Rust HTTP Gateway Locally</h3>
+        <p>
+          This page demonstrates Decora’s real protocol translation, passthrough, failover, and math verification engine in WebAssembly.
+          To run the full multi-threaded <code>axum</code>/<code>tokio</code> HTTP gateway, execute all 43 offline integration tests, or run the live OpenAI &amp; Gemini proof script:
+        </p>
+      </div>
+      <div class="cli-grid">
+        <div class="cli-block">
+          <span class="cli-label">1. Offline Test Suite (43 tests, zero API keys)</span>
+          <pre><code>git clone https://github.com/Yan-Zero/decora.git
+cd decora
+cargo test --locked</code></pre>
+        </div>
+        <div class="cli-block">
+          <span class="cli-label">2. Reproducible 4-Provider End-to-End Proof</span>
+          <pre><code>bash demo/run.sh
+# Optional live run against real OpenAI &amp; Gemini APIs:
+DEMO_REAL=1 bash demo/capture.sh</code></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <span>Decora · MIT License · Built with Kiro for Kiroween 2026 (Frankenstein)</span>
+      <span>Live WASM Protocol Converter Demo — Client-side Rust <code>wasm32-unknown-unknown</code></span>
+    </div>
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -1,30 +1,39 @@
 //! YAML configuration stores only environment variable names; actual credentials are resolved at startup and are not included in Debug output.
+#[cfg(feature = "server")]
 use reqwest::Url;
 use serde::Deserialize;
+#[cfg(feature = "server")]
 use std::{
     collections::{BTreeMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::Path,
 };
 
+#[cfg(feature = "server")]
 fn listen() -> SocketAddr {
     "127.0.0.1:8787".parse().unwrap()
 }
+#[cfg(feature = "server")]
 fn body() -> usize {
     8 * 1024 * 1024
 }
+#[cfg(feature = "server")]
 fn images() -> usize {
     32
 }
+#[cfg(feature = "server")]
 fn timeout() -> u64 {
     30_000
 }
+#[cfg(feature = "server")]
 fn deadline() -> u64 {
     60_000
 }
+#[cfg(feature = "server")]
 fn attempts() -> usize {
     3
 }
+#[cfg(feature = "server")]
 fn concurrency() -> usize {
     64
 }
@@ -99,6 +108,7 @@ pub struct Backend {
     pub capabilities: Capabilities,
 }
 /// Decora single-tenant configuration. Non-loopback listening requires explicit authorization and inbound authentication.
+#[cfg(feature = "server")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -128,6 +138,7 @@ pub struct Config {
     pub backends: BTreeMap<String, Backend>,
     pub models: BTreeMap<String, Vec<String>>,
 }
+#[cfg(feature = "server")]
 impl Config {
     /// Read YAML; errors do not include file contents or possible credentials.
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -212,6 +223,7 @@ impl Config {
         Ok(())
     }
 }
+#[cfg(feature = "server")]
 fn check_env_name(name: &str) -> Result<(), String> {
     if name.is_empty()
         || !name
@@ -224,6 +236,7 @@ fn check_env_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 /// Resolve credentials; the caller supplies a lookup function so offline tests do not modify the process environment.
+#[cfg(feature = "server")]
 pub fn resolve_secret(
     name: &str,
     lookup: &impl Fn(&str) -> Option<String>,
